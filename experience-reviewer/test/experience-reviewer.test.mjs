@@ -429,7 +429,7 @@ test('projectIdFromCwd: sha256 前 16 位, 与 OCM 实测一致', () => {
   assert.equal(pid, 'b86d670963d94466') // 已从 memory.db 实测验证
 })
 
-test('buildSubagentPrompt: 规则/JSON schema 在前, 对话记录在后 (KV cache 前缀稳定)', () => {
+test('buildSubagentPrompt: 对话记录在前, 规则/JSON schema 在后', () => {
   const prompt = buildSubagentPrompt([
     { message_id: '1', role: 'user', text: '你好' },
     { message_id: '2', role: 'assistant', text: '世界' },
@@ -438,16 +438,15 @@ test('buildSubagentPrompt: 规则/JSON schema 在前, 对话记录在后 (KV cac
   assert.ok(prompt.includes('[助手] 世界'))
   assert.ok(prompt.includes('"simple"'))
   assert.ok(prompt.includes('"complex"'))
-  // 结构: 静态规则段在前 (跨 REVIEW 字节不变 → KV cache 命中), transcript 段在末尾 (变量)
+  // 结构: 对话记录在前 (前缀与主会话一致), 规则/JSON 在末尾
   const dialogMarker = prompt.indexOf('===== 对话记录 =====')
   const taskMarker = prompt.indexOf('===== 提取任务 =====')
-  assert.ok(taskMarker >= 0 && dialogMarker > taskMarker, '提取任务应在对话记录之前 (稳定前缀在前)')
-  assert.ok(taskMarker < prompt.indexOf('你是经验提取器'), '角色定义应在提取任务之后')
-  assert.ok(prompt.indexOf('你是经验提取器') < dialogMarker, '规则指令应在对话记录之前')
+  assert.ok(dialogMarker >= 0 && taskMarker > dialogMarker, '对话记录应在提取任务之前')
+  assert.ok(dialogMarker < prompt.indexOf('你是经验提取器'), '对话记录应在规则之前')
   assert.ok(prompt.includes('≤50'), 'simple 应有 ≤50 字约束')
-  // JSON schema 必须在 transcript 之前 (稳定 cache prefix 含 schema)
+  // JSON schema 必须在 transcript 之后 (规则在末尾)
   const jsonPos = prompt.indexOf('"simple":[{')
-  assert.ok(jsonPos > 0 && jsonPos < dialogMarker, 'JSON schema 应在对话记录之前')
+  assert.ok(jsonPos > dialogMarker, 'JSON schema 应在对话记录之后')
 })
 
 test('groupIntoTurns: user+assistant = 完整一轮, cursor 推进到 assistant 末尾', () => {

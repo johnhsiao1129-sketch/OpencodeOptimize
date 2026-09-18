@@ -354,10 +354,8 @@ function writeCursor(cursorPath, cursor) {
 }
 
 /**
- * 构建 subagent 提示词: 提取规则/JSON schema 在前, 对话记录原文在后。
- * 借鉴 Claude Code `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 模式: 静态规则段/动态 transcript 段。
- * 规则段全固定 → 前缀 = 规则 + JSON schema (跨 REVIEW 字节不变) → KV cache prefix 命中。
- * 对话记录每次 REVIEW cursor 推进内容不同, 放在末尾 → 不影响 cache prefix。
+ * 构建 subagent 提示词: 对话记录原文在前, 提取规则在最末尾。
+ * 规则部分全固定 → 前缀 = 对话原文 (与主会话一致), 规则注入不打断前缀缓存 (KV cache 友好)。
  */
 function buildSubagentPrompt(messages) {
   const { turns } = groupIntoTurns(messages)
@@ -369,20 +367,19 @@ function buildSubagentPrompt(messages) {
       return `[轮次 ${i + 1}]\n${userText}\n${asstText}`
     })
     .join('\n\n')
-  // 稳定前缀在前: 规则 + JSON schema (跨 REVIEW 字节不变 → KV cache 命中)
-  // 变量 transcript 在末尾: cursor 推进内容不同 → 不影响 cache prefix
+  // 上下文原文在前, 提取规则在最末尾 (规则固定, 前缀=对话原文 → KV cache 一致)
   return (
+    `===== 对话记录 =====\n${transcript}\n\n` +
     `===== 提取任务 =====\n` +
-    `你是经验提取器。阅读下方对话记录, 提取值得沉淀为经验的内容。\n\n` +
+    `你是经验提取器。阅读上方对话记录, 提取值得沉淀为经验的内容。\n` +
     `规则:\n` +
     `1. simple: 一句话能说明白的 规则/偏好/事实/教训, 单条 ≤50 字单句。scope: global=跨项目通用, 否则 project。\n` +
     `2. complex: 需多行才说得清的 可复用知识/流程。字段 title/description/content/scope/type。` +
     `description 以 "使用时机: " 开头; type ∈ dev/research/data/process/negative。\n` +
     `3. 不重复: 相同或高度相似内容只保留一条。\n` +
-    `4. 无内容 → 输出空数组, 不要编造。\n\n` +
-    `输出格式 (只输出 JSON, 不要 markdown 代码块包裹, 不要其他文字):\n` +
-    `{"simple":[{"scope":"project","text":"..."}],"complex":[]}\n\n` +
-    `===== 对话记录 =====\n${transcript}`
+    `4. 无内容 → 输出空数组, 不要编造。\n` +
+    `只输出 JSON (不要 markdown 代码块包裹, 不要其他文字):\n` +
+    `{"simple":[{"scope":"project","text":"..."}],"complex":[]}`
   )
 }
 

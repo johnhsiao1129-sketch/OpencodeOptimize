@@ -34,14 +34,16 @@
 - 提取窗口 PROMPT_LEN=0 时前移 cursor.lastMessageId 到最近完整轮次之前, 重查 DB 确认边界
 - 提取规则里 simple 约束须量化 ≤50 字, 只写"一句话"会被 LLM 输出成百字长句冒充
 - 做 review 端到端验证时先备份 cursor/AGENTS.md，防旧实例并发污染
-- 提取任务对话原文占 prompt 超九成且不可跨 REVIEW 复用，命中率低是结构特性非缺陷。
-- 经验提取prompt原结构是对话前置/规则后置, 对前缀缓存是反的, 应稳定块前置
+- 提取 prompt 命中率取决于是否复用主会话前缀: 对话前置 + 规则最末 → 生产实测 ~98%; 规则前置 → 跌到 ~5%
+- 经验提取 prompt 正确结构 = 系统提示(与主会话一致)在前 + 对话记录 + 任务提示词/规则最末; 规则前置是负优化, 截断共享前缀
 - AGENTS.md是项目级变量, 塞进subagent会把固定前缀变变量前缀, 摧毁缓存复用
-- 同REVIEW内多步推理对话100%命中; 跨REVIEW窗口移动无共享前缀, 对话段必0命中
+- MiniMax 缓存即前缀匹配且不认 session: 提取请求对话段与主会话累积历史前缀一致即命中(跨 REVIEW 98%)
 - 时间戳/随机ID等动态token放prefix段会让缓存永远0命中
-- 单次98%命中率是小窗口偶然,真实均值~85%,别被高分迷惑
+- 命中率以真实生产多轮实测为准: 对话前置稳定 ~98% (用户多项目实测); 单次/小窗口波动别当趋势, E2E 同源切片别当证据
 - 跨session的轮次触发依赖全局基线时相减为负被clamp成0,永不触发
-- buildSubagentPrompt v2 已翻面: 规则/JSON schema 在最前, transcript 在最末. E2E 验证同项目 cache 命中率从 ~5% 拉到 99% (2/3 跑 99.09/99.23%), 跨项目 cache 池隔离是预期行为 (4.12% 那次换了 project_id). 借鉴 Claude Code `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 模式: 静态段/动态段
-- KV cache 友好 prompt 核心: 稳定段字节跨 call 不变 → 必须放最前; 变量段 (transcript/timestamp/randomId) 放最后. 任何动态 token 混进 prefix 段 → 永远 0 命中
-- 验证 cache 提升做控制变量: 改 prompt 后 E2E 跑 3 轮+ 同项目 rewind 不同点, 看 max/min/avg 命中率; 单次高分是偶然, avg < 50% 没意义
+- buildSubagentPrompt 保持对话前置 + 规则最末 (v1 结构为最终正确): 生产多项目实测 ~98%; 曾翻面(规则前置)后所有项目跌到 ~5%, 已回滚. E2E rewind 同源切片 99% 是人造产物, 不代表生产
+- KV cache 友好: 稳定段字节跨 call 不变 → 放最前. 但提取 prompt 的"稳定段" = 与主会话共享的 system+对话前缀, 不是自定义规则段; 规则段前置 = 截断共享前缀, 命中率降至其占比 (~5%). 时间戳/随机ID 混进 prefix 段 → 永远 0 命中
+- 验证 cache 提升不能靠 E2E rewind 同源切片 (人造高命中; 教训: E2E 99% vs 生产 5%); 必须以真实生产多项目实测为准
 - 开源 README 双语(英先中后)精炼, 安装指引可直接复制给 opencode 自行执行
+- README 章节顺序偏好: 先介绍内容与解决的问题, 安装段言简意赅一屏装下
+- 回滚方案先存当前版反向备份再恢复目标版, 同步改回测试断言并跑全量测试
