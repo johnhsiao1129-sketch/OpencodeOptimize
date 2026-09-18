@@ -44,3 +44,4 @@
 - buildSubagentPrompt v2 已翻面: 规则/JSON schema 在最前, transcript 在最末. E2E 验证同项目 cache 命中率从 ~5% 拉到 99% (2/3 跑 99.09/99.23%), 跨项目 cache 池隔离是预期行为 (4.12% 那次换了 project_id). 借鉴 Claude Code `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 模式: 静态段/动态段
 - KV cache 友好 prompt 核心: 稳定段字节跨 call 不变 → 必须放最前; 变量段 (transcript/timestamp/randomId) 放最后. 任何动态 token 混进 prefix 段 → 永远 0 命中
 - 验证 cache 提升做控制变量: 改 prompt 后 E2E 跑 3 轮+ 同项目 rewind 不同点, 看 max/min/avg 命中率; 单次高分是偶然, avg < 50% 没意义
+- 开源 README 双语(英先中后)精炼, 安装指引可直接复制给 opencode 自行执行
