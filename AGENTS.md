@@ -1,0 +1,46 @@
+- 单次 `opencode run` 是独立进程: 插件 `sessions` Map 内存态不跨进程, 跨进程 `-s` 续会话轮次计数永远不触发, 验证必须靠同进程内多次 chat 请求(工具循环)+时间触发
+- 假 server 检测注入必须扫描全部消息: opencode 工具循环里工具结果 role=tool、user 消息恒在索引 0, 只查 messages[-1] 会永远检测不到注入导致无限 tool_calls 死循环
+- 真实主会话验证已通过: TRIGGER(timeHit) → EXTRACT → MD_WRITE 全链路日志可查, AGENTS.md 落盘成功
+- 无头验证剩余问题: 工具循环内时间触发未生效, 优先查插件日志 timeIntervalMs 是否被 EXP_REVIEW_TIME_INTERVAL_MS 覆盖
+- OCM 插件的 projectId 由 hashDirectory(info.directory) 计算, 必须拿到 opencode 钩子真实传入的 directory 字符串, 否则算出的 hash 与库中项目 ID 对不上
+- Windows PowerShell 传路径会被转义成双反斜杠 (D:\\) 导致 hash 不匹配, 验证 hash 类逻辑时用干净文件/脚本绕开 shell 转义
+- projectId 对不上 (插件算出 20188cce vs 库中 b86d670963d94466) 直接表现为查库 0 条消息, 排查路径是穷举 directory 变体反推 opencode 实际传入字符串
+- experience-reviewer 插件默认触发条件: ≥3 轮用户消息 或 ≥10 分钟, 可用 EXP_REVIEW_ROUND_INTERVAL / EXP_REVIEW_TIME_INTERVAL_MS 环境变量覆盖(只 spawn 时加载)
+- experience-reviewer 插件加载成功的信号: 日志出现 server() STARTED [experience-reviewer] + TRANSFORM_WATCH, 且 cursor 状态文件(含 lastMessageId/lastReviewAt/lastReviewRound)已生成; 修复前此日志缺失即插件被静默跳过
+- experience-reviewer 插件轮次触发是废的: roundsSince = 当前 session 内用户消息数 − 全局 cursor 基线 lastReviewRound, 跨 session 恒为 0 (负数被 clamp), 不是"对话不算", 真正可靠的是时间触发 timeHit (600s)。
+- experience-reviewer 插件在 opencode 启动时应检查项目根目录是否有 .omo 文件夹, 没有则创建, 统计文件必须落在该路径下, 否则无法保证同路径统计准确性。
+- experience-reviewer 插件不能依赖 .omo 目录 (oh-my-opencode 插件的专属目录), 否则用户没装该插件时项目无法运行. 应创建自己的目录 .experience-reviewer, 并在 opencode 启动时检查, 不存在则创建, 存在则使用. 同时同步修改测试文件中的路径断言 (测试虚拟路径 C:/proj 下的目录名也要换).
+- opencode `-f/--file` 语义是"附加文件到消息"而非"从文件读 prompt"，使用时必须同时通过 positional argument 传 message，否则报 `You must provide a message or a command`
+- OCM MCP server 固定监听 7333 端口,同时开多个 opencode 实例会争用该端口,后启动的实例 EADDRINUSE 断连
+- OCM server 断连后不会自动重连,必须完全重启 opencode 才会重新 spawn
+- 用 `opencode run --pure` 做验证时会挂起超时并留下残留进程，跑完必须检查残留进程并清理；强杀刚启动的进程可能失败，等进程列表刷新后再重试一次
+- 验证命令挂死先杀残留 PID，主进程不受影响无需重启
+- 验证轮次聚合模型要用真实 opencode.db, 而非 mock: cursor 之后的窗口应聚合出完整轮次 (完整度是验收点)
+- 项目同时支持 node + bun 双运行时, 改完核心逻辑除了跑全量 Jest 测试, 还要跑 bun smoke 验双运行时兼容
+- 轮次列表里 user 文本以「你是经验提取器」开头的都是 experience-reviewer 的 subagent 自污染轮, 不是真用户对话
+- 读取量过大(token 受不了)时可手动改 .experience-reviewer/experience-cursor.json 的 lastMessageId 为最近 N 轮末尾的 assistant message id, 下次 review 只读最近几轮(实测 241→29 条, 约 1/8)
+- 改插件代码后旧 opencode 实例退出前仍会用内存里的旧代码触发 review(spawn 不带新标记), 端到端验证前必须确认触发方是新实例或重启 opencode
+- experience-reviewer 的轮次触发条件是 `roundsSince >= 3`（含等于3，代码是 `>=` 非 `==`）；触发后 lastReviewRound 被推高到当轮 userCount，差值归 0 表示刚回顾过、进入冷却期
+- 经验沉淀按长度分流: 短(simple)→AGENTS.md注入, 长(complex多行)→OCM经验表, 总结用最简语言
+- simple提取须量化约束(≤50字单句), 提示词只写"一句话"LLM会输出百字分句长句冒充
+- 提示词要保 KV cache 命中: 系统提示注入放最前、对话原文/提取规则放最末尾
+- 验证 KV cache 命中率从模型返回的 usage.tokens.cache.read/write 拿, 写进 cursor 统计字段
+- 提取提示词的 simple 约束必须量化(≤50字单句), 仅写"一句话"会让 LLM 输出百字长句冒充
+- PowerShell 下 node -e 内嵌双引号会被吞, 查库等改走临时 .mjs 脚本绕行
+- 删工具调用、保留工具返回内容, 且去掉工具调用后前缀保持稳定才能触发 KV cache
+- review 提取结果 PROMPT_LEN=0 时先查 cursor 窗口内是否有"完整轮次"(user 消息 + 对应 assistant 回复)；若唯一新 user 消息尚无 assistant 回复则无完整轮次，诊断需把 cursor 前移到最近完整轮次之前再重查 DB 轮次边界。
+- 旧 opencode 实例退出前仍用内存里的旧代码触发 review, 端到端验证须由独立脚本加载新代码 fireReview 驱动
+- 做端到端 review 验证前先备份 cursor/AGENTS.md, 跑完按证据决定去留, 防旧实例并发污染
+- 提取窗口 PROMPT_LEN=0 时前移 cursor.lastMessageId 到最近完整轮次之前, 重查 DB 确认边界
+- 提取规则里 simple 约束须量化 ≤50 字, 只写"一句话"会被 LLM 输出成百字长句冒充
+- 做 review 端到端验证时先备份 cursor/AGENTS.md，防旧实例并发污染
+- 提取任务对话原文占 prompt 超九成且不可跨 REVIEW 复用，命中率低是结构特性非缺陷。
+- 经验提取prompt原结构是对话前置/规则后置, 对前缀缓存是反的, 应稳定块前置
+- AGENTS.md是项目级变量, 塞进subagent会把固定前缀变变量前缀, 摧毁缓存复用
+- 同REVIEW内多步推理对话100%命中; 跨REVIEW窗口移动无共享前缀, 对话段必0命中
+- 时间戳/随机ID等动态token放prefix段会让缓存永远0命中
+- 单次98%命中率是小窗口偶然,真实均值~85%,别被高分迷惑
+- 跨session的轮次触发依赖全局基线时相减为负被clamp成0,永不触发
+- buildSubagentPrompt v2 已翻面: 规则/JSON schema 在最前, transcript 在最末. E2E 验证同项目 cache 命中率从 ~5% 拉到 99% (2/3 跑 99.09/99.23%), 跨项目 cache 池隔离是预期行为 (4.12% 那次换了 project_id). 借鉴 Claude Code `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 模式: 静态段/动态段
+- KV cache 友好 prompt 核心: 稳定段字节跨 call 不变 → 必须放最前; 变量段 (transcript/timestamp/randomId) 放最后. 任何动态 token 混进 prefix 段 → 永远 0 命中
+- 验证 cache 提升做控制变量: 改 prompt 后 E2E 跑 3 轮+ 同项目 rewind 不同点, 看 max/min/avg 命中率; 单次高分是偶然, avg < 50% 没意义

@@ -1,0 +1,26 @@
+# Runtime state (per-project, regenerated on startup — DO NOT commit)
+.experience-reviewer/
+.omo/
+.anything-graph/
+.codegraph/
+.mindscape/
+
+# Backups
+*.bak
+*.bak-*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Node
+node_modules/
+
+# Logs (debug only, regenerated)
+*.log

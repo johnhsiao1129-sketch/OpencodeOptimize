@@ -1,0 +1,92 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "siliconflow": {
+      "api": "openai-completions",
+      "name": "SiliconFlow",
+      "options": {
+        "apiKey": "${env:SILICONFLOW_API_KEY}",
+        "baseURL": "https://api.siliconflow.cn/v1"
+      },
+      "models": {
+        "BAAI/bge-m3": {
+          "id": "BAAI/bge-m3",
+          "name": "BAAI/bge-m3",
+          "limit": {
+            "context": 8192,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "permission": {},
+  "reference": {
+    "effect": "github.com/Effect-TS/effect-smol"
+  },
+  "mcp": {
+    "oc-memory": {
+      "type": "local",
+      "command": [
+        "node",
+        "D:/AI/my_programs/OCM/plugin-v2/src/mcp/server.js"
+      ],
+      "enabled": true
+    },
+    "anything-graph": {
+      "type": "local",
+      "command": [
+        "node",
+        "D:/AI/my_programs/Anything_Graph/packages/mcp-server/dist/server.js"
+      ],
+      "enabled": true,
+      "environment": {
+        "AG_EMBEDDING_API_KEY": "${env:AG_EMBEDDING_API_KEY}",
+        "AG_EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
+        "AG_EMBEDDING_MODEL": "BAAI/bge-m3",
+        "AG_EMBEDDING_DIMENSION": "1024"
+      }
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true
+    },
+    "hyperbrowser": {
+      "type": "local",
+      "command": [
+        "C:\\Users\\JohnHsiao\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+        "-m",
+        "hyperbrowser.mcp_server"
+      ],
+      "enabled": true,
+      "environment": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
+    "mission": {
+      "type": "local",
+      "command": [
+        "C:\\Users\\JohnHsiao\\.config\\opencode\\venv\\Scripts\\python.exe",
+        "C:\\Users\\JohnHsiao\\.config\\opencode\\skills\\mission-complete\\server.py"
+      ],
+      "enabled": true,
+      "environment": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  },
+  "tools": {
+    "github-triage": false,
+    "github-pr-search": false
+  },
+  "plugin": [
+    "D:/AI/my_programs/OCM/plugin-v2/index.js",
+    "D:/AI/my_programs/Anything_Graph/packages/system-prompt-injector/dist/plugin.js",
+    "D:/AI/my_programs/Mindscape/plugin/index.js",
+    "oh-my-openagent",
+    "D:/AI/my_programs/OpencodeOptimize/task-context-injector/index.js",
+    "D:/AI/my_programs/OpencodeOptimize/watchdog/index.js",
+    "D:/AI/my_programs/OpencodeOptimize/experience-reviewer/index.js"
+  ]
+}

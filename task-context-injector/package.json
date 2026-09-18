@@ -1,0 +1,7 @@
+{
+  "name": "opencode-task-context-injector",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "main": "index.js"
+}
