@@ -269,14 +269,19 @@ test('extractJsonBlock: 纯 JSON / 带前缀 / 代码块', () => {
   assert.equal(extractJsonBlock(''), null)
 })
 
-test('parseReviewOutput: simple/complex 解析 + scope 归一', () => {
+test('parseReviewOutput: simple/complex 解析 + suggestGlobal 判定 (v2.2 归一)', () => {
   const out = parseReviewOutput(
-    '{"simple":[{"scope":"global","text":"G1"},{"scope":"project","text":"P1"},{"text":"无scope"}],"complex":[{"title":"T1","content":"C1","description":"使用时机: x"}]}'
+    '{"simple":[{"scope":"global","text":"G1"},{"scope":"project","text":"P1"},{"text":"无scope"},{"suggestGlobal":true,"text":"SG1"}],"complex":[{"title":"T1","content":"C1","description":"使用时机: x"}]}'
   )
-  assert.equal(out.simple.length, 3)
-  assert.equal(out.simple[0].scope, 'global')
+  assert.equal(out.simple.length, 4)
+  // scope 一律 project; 旧 scope=global 与 suggestGlobal=true 归一为 suggestGlobal
+  assert.equal(out.simple[0].scope, 'project')
+  assert.equal(out.simple[0].suggestGlobal, true, 'scope=global → suggestGlobal=true')
   assert.equal(out.simple[1].scope, 'project')
+  assert.equal(out.simple[1].suggestGlobal, false)
   assert.equal(out.simple[2].scope, 'project', '无 scope 默认 project')
+  assert.equal(out.simple[2].suggestGlobal, false)
+  assert.equal(out.simple[3].suggestGlobal, true, 'suggestGlobal=true 透传')
   assert.equal(out.complex.length, 1)
   assert.equal(out.complex[0].title, 'T1')
 })
@@ -286,17 +291,18 @@ test('parseReviewOutput: 非 JSON → 空结果', () => {
   assert.deepEqual(out, { simple: [], complex: [] })
 })
 
-test('写入: project/global 分流 + 去重', () => {
+test('写入: 全部写项目 MD (v2.2), suggestGlobal → [建议全局] 前缀, 去重', () => {
   const { deps, files } = makeDeps()
   const r = createExperienceReviewer(deps)
   r.writeSimpleEntries([
-    { scope: 'project', text: '本地规则' },
-    { scope: 'global', text: '全局规则' },
+    { scope: 'project', suggestGlobal: false, text: '本地规则' },
+    { scope: 'project', suggestGlobal: true, text: '疑似全局规则' },
   ])
   assert.ok(files.get(PROJ_MD).includes('本地规则'))
-  assert.ok(files.get(GLOBAL_MD).includes('全局规则'))
+  assert.ok(files.get(PROJ_MD).includes('- [建议全局] 疑似全局规则'), 'suggestGlobal 加 [建议全局] 前缀')
+  assert.ok(!files.has(GLOBAL_MD), 'v2.2 不直写全局 AGENTS.md')
   // 再写同样的 → 去重, 不重复
-  r.writeSimpleEntries([{ scope: 'project', text: '本地规则' }])
+  r.writeSimpleEntries([{ scope: 'project', suggestGlobal: false, text: '本地规则' }])
   const content = files.get(PROJ_MD)
   const count = content.split('本地规则').length - 1
   assert.equal(count, 1, '不应重复')
@@ -316,6 +322,59 @@ test('写入: 大小上限', () => {
   assert.ok(content.includes('a'.repeat(40)) && content.includes('b'.repeat(40)), '前两条应在')
   assert.ok(!content.includes('c'.repeat(40)), '第三条超上限不应写入')
   assert.ok(logs.some((l) => l.includes('MD_FULL')), '应告警 MD_FULL')
+})
+
+test('ensureOverviewReminder: 有概述标记 → 记 hasOverview, 不注入', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '> **项目概述**: 测试项目\n# 项目规则\n- 规则1\n')
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureOverviewReminder({ messages })
+  assert.equal(messages[0].parts.length, 1, '有概述不应注入')
+  const cursor = r.readCursor(join('C:/proj', '.experience-reviewer', 'experience-cursor.json'))
+  assert.equal(cursor.hasOverview, true, '应记录 hasOverview=true')
+})
+
+test('ensureOverviewReminder: 缺概述标记 → 注入一次 + overviewPrompted, 不重复', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '# 项目规则\n- 规则1\n') // 无 > **项目概述**: 标记
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureOverviewReminder({ messages })
+  const lastUser = messages[messages.length - 1]
+  assert.ok(
+    lastUser.parts.some((p) => p.synthetic === true && p.text.includes('项目概述')),
+    '缺概述应注入 synthetic 提醒 part'
+  )
+  const cursor = r.readCursor(join('C:/proj', '.experience-reviewer', 'experience-cursor.json'))
+  assert.equal(cursor.overviewPrompted, true, '应记录 overviewPrompted=true')
+  // 再次调用 → 不重复注入 (防每轮刷屏)
+  const messages2 = msgs(1)
+  r.ensureOverviewReminder({ messages: messages2 })
+  assert.equal(messages2[0].parts.length, 1, '已提醒过不重复注入')
+})
+
+test('ensureOverviewReminder: 最后一条非 user (assistant 生成/工具循环) → 不注入', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '# 项目规则\n- 规则1\n')
+  const r = createExperienceReviewer(deps)
+  // user 消息后紧跟 assistant 消息: 模拟助手生成/工具循环阶段的 transform
+  const user = msgs(1)[0]
+  const assistant = { info: { role: 'assistant' }, parts: [{ type: 'text', text: 'ok' }] }
+  const messages = [user, assistant]
+  r.ensureOverviewReminder({ messages })
+  assert.equal(user.parts.length, 1, 'tail 非 user 不应注入')
+  const cursor = r.readCursor(join('C:/proj', '.experience-reviewer', 'experience-cursor.json'))
+  assert.notEqual(cursor?.overviewPrompted, true, '不应写 overviewPrompted')
+})
+
+test('ensureOverviewReminder: 项目开关 disabled → 跳过', () => {
+  const { deps, files } = makeDeps()
+  files.set(join('C:/proj', '.experience-reviewer', 'config.json'), JSON.stringify({ enabled: false }))
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureOverviewReminder({ messages })
+  assert.equal(messages[0].parts.length, 1, 'disabled 不注入')
 })
 
 test('readUnsummarizedMessages: directory 匹配 + cursor 增量 (time_created > last)', () => {
@@ -763,4 +822,320 @@ test('writeSimpleEntries: 正常长度 simple 仍写入 (护栏不误伤)', asyn
   assert.ok(files.has(PROJ_MD), '正常长度 simple 应写入')
   assert.ok(files.get(PROJ_MD).includes('目录区分大小写'))
   assert.ok(logs.every((l) => !l.includes('MD_TOO_LONG')), '不应有 MD_TOO_LONG')
+})
+
+// ===== 按项目开关: <项目根>/.experience-reviewer/config.json {"enabled": false} =====
+const CONFIG_PATH = join('C:/proj', '.experience-reviewer', 'config.json')
+
+test('项目开关: 无 config → 默认开启 (不误伤)', () => {
+  const { deps, files, logs } = makeDeps()
+  const r = createExperienceReviewer(deps)
+  assert.equal(r.isDisabled(), false, '无 config 应默认开启')
+  // handleTransform 正常走触发逻辑 (首次写基线 cursor, 不触发)
+  r.handleTransform({ messages: msgs(3) })
+  assert.ok(!logs.some((l) => l.startsWith('TRIGGER')), '首次不应触发')
+  const cursor = r.readCursor()
+  assert.equal(cursor.lastReviewRound, 3, '应正常写基线 cursor')
+})
+
+test('项目开关: config enabled=false → handleTransform 完全跳过 (不写 cursor)', () => {
+  const { deps, files, logs } = makeDeps()
+  files.set(CONFIG_PATH, JSON.stringify({ enabled: false }))
+  const r = createExperienceReviewer(deps)
+  assert.equal(r.isDisabled(), true, 'enabled=false 应判定为关闭')
+  r.handleTransform({ messages: msgs(5) })
+  assert.equal(r.readCursor(), null, 'disabled 时不应写任何 cursor')
+  assert.ok(logs.every((l) => !l.startsWith('TRIGGER') && !l.startsWith('TRANSFORM_WATCH')), '不应有任何触发/观察日志')
+})
+
+test('项目开关: config enabled=false → fireReview 返回 false + REVIEW_SKIP disabled-by-config', async () => {
+  const { deps, files, logs } = makeDeps()
+  files.set(CONFIG_PATH, JSON.stringify({ enabled: false }))
+  const r = createExperienceReviewer(deps)
+  const ok = await r.fireReview()
+  assert.equal(ok, false, 'disabled 时 fireReview 应返回 false')
+  assert.ok(logs.some((l) => l.includes('REVIEW_SKIP reason=disabled-by-config')), '应有 disabled-by-config 日志')
+  // 兜底: 即使被外部直接调用 fireReview 也被拦截, 不会 spawn subagent
+  assert.ok(!logs.some((l) => l.includes('REVIEW_START')), '不应走到 REVIEW_START')
+})
+
+test('项目开关: config enabled=true 或损坏 → 不误伤 (视为开启)', async () => {
+  const { deps, files, logs } = makeDeps()
+  files.set(CONFIG_PATH, JSON.stringify({ enabled: true }))
+  const r = createExperienceReviewer(deps)
+  assert.equal(r.isDisabled(), false, 'enabled=true 应开启')
+  // 损坏 JSON → 视为开启 (不误伤)
+  const { deps: d2, files: f2, logs: l2 } = makeDeps()
+  f2.set(CONFIG_PATH, '{broken json')
+  const r2 = createExperienceReviewer(d2)
+  assert.equal(r2.isDisabled(), false, '损坏 config 应视为开启')
+})
+
+test('buildSubagentPrompt: 传项目概述 → 注入项目身份段, subagent 知道所处项目', () => {
+  const prompt = buildSubagentPrompt(
+    [
+      { message_id: '1', role: 'user', text: '你好' },
+      { message_id: '2', role: 'assistant', text: '世界' },
+    ],
+    'opencode 插件集' // 项目概述
+  )
+  assert.ok(prompt.includes('你正在为以下项目提取经验'), '应包含项目身份引导词')
+  assert.ok(prompt.includes('opencode 插件集'), '应包含项目概述内容')
+  // 身份段必须在对话记录之前 (顺序: 项目身份 → 对话记录 → 规则)
+  const identityPos = prompt.indexOf('===== 项目身份 =====')
+  const dialogMarker = prompt.indexOf('===== 对话记录 =====')
+  assert.ok(identityPos >= 0 && identityPos < dialogMarker, '项目身份段应在对话记录之前')
+})
+
+test('buildSubagentPrompt: 不传概述 → 无项目身份段 (向后兼容)', () => {
+  const prompt = buildSubagentPrompt([
+    { message_id: '1', role: 'user', text: '你好' },
+    { message_id: '2', role: 'assistant', text: '世界' },
+  ])
+  assert.ok(!prompt.includes('===== 项目身份 ====='), '无概述不应生成身份段')
+  assert.ok(prompt.includes('===== 对话记录 ====='), '对话记录应保留')
+})
+
+test('buildSubagentPrompt: 容量规则只作参考, 未达上限时不限制提取', () => {
+  const prompt = buildSubagentPrompt(
+    [{ message_id: '1', role: 'user', text: '你好' }, { message_id: '2', role: 'assistant', text: '世界' }],
+    '',
+    10
+  )
+  assert.ok(prompt.includes('当前 10 条'), '应注入当前条数')
+  assert.ok(prompt.includes('上限 100 条'), '应注入上限条数')
+  assert.ok(prompt.includes('正常提取'), '未达上限应允许正常提取')
+  assert.ok(!prompt.includes('禁止新增条目'), '任何条数下都不应禁止新增')
+})
+
+test('buildSubagentPrompt: 已达上限 → 仍允许提取, 不做写入拦截', () => {
+  const prompt = buildSubagentPrompt(
+    [{ message_id: '1', role: 'user', text: '你好' }, { message_id: '2', role: 'assistant', text: '世界' }],
+    '',
+    120
+  )
+  assert.ok(prompt.includes('当前 120 条'), '应注入当前条数')
+  assert.ok(prompt.includes('不限制提取'), '达上限后不限制提取')
+  assert.ok(prompt.includes('正常提取'), '达上限后仍应正常提取')
+  assert.ok(!prompt.includes('禁止新增条目'), '达上限不应禁止新增')
+  assert.ok(!prompt.includes('已达上限'), '不应再有达上限拦截分支')
+  assert.ok(!prompt.includes('prune'), '不应再要求 subagent 输出 prune 清单')
+})
+
+test('ensureRecycleReminder: 提醒里给出 60% 动态压缩目标 (非仅"压到上限内")', () => {
+  const { deps, files } = makeDeps()
+  const many = '# 项目规则\n' + Array.from({ length: 110 }, (_, i) => `- 条目${i}`).join('\n') + '\n'
+  files.set(PROJ_MD, many)
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureRecycleReminder({ messages })
+  const lastUser = messages[messages.length - 1]
+  const injected = lastUser.parts.filter((p) => p.synthetic === true).map((p) => p.text).join('\n')
+  assert.ok(injected.includes('110 条'), '应含实际条数')
+  assert.ok(injected.includes('压到 60 条以内'), '应含 60% 计算出的压缩目标 (100*0.6)')
+  // 7 个清理方向必须齐全, 否则主 agent 无判定依据
+  for (const d of [
+    '不符合存储门槛',
+    '已解决的问题',
+    '重复/同义',
+    '作用域错位',
+    '同一主题拆成多条',
+    '低频场景占常驻',
+    '依赖环境已变化',
+  ]) {
+    assert.ok(injected.includes(d), `应含清理方向: ${d}`)
+  }
+  // 门槛白名单须正向声明 (避免 agent 反读成"这四类要删")
+  assert.ok(injected.includes('门槛 = 用户偏好'), '应正向声明门槛白名单')
+  assert.ok(injected.includes('不得跳过推迟'), '应含不得跳过的硬约束')
+  // 项目标识来自目录名, 便于多项目时区分是哪条经验
+  assert.ok(injected.includes('【'), '应含项目标识前缀')
+})
+
+test('ensureSuggestGlobalReminder: 有 [建议全局] 条目 → 注入询问提醒 + 记条数, 不重复', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '# 项目规则\n- [建议全局] 用户偏好中文\n- [建议全局] 工具链通用坑\n- 本地规则\n')
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages })
+  const lastUser = messages[messages.length - 1]
+  assert.ok(
+    lastUser.parts.some((p) => p.synthetic === true && p.text.includes('[建议全局]') && p.text.includes('用户询问')),
+    '应注入询问用户提醒'
+  )
+  const cursor = r.readCursor(join('C:/proj', '.experience-reviewer', 'experience-cursor.json'))
+  assert.equal(cursor.suggestGlobalPromptedCount, 2, '应记录提醒时条数=2')
+  // 再次调用 → 不重复注入 (防每轮刷屏)
+  const messages2 = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages: messages2 })
+  assert.equal(messages2[0].parts.length, 1, '已提醒过相同条数不重复注入')
+})
+
+test('ensureSuggestGlobalReminder: 新增条目数 > 上次提醒 → 再次提醒', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '- [建议全局] 一条\n')
+  const r = createExperienceReviewer(deps)
+  r.ensureSuggestGlobalReminder({ messages: msgs(1) })
+  // 新增一条 → 2 > 1 → 再提醒
+  files.set(PROJ_MD, '- [建议全局] 一条\n- [建议全局] 新增一条\n')
+  const messages = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages })
+  assert.ok(
+    messages[0].parts.some((p) => p.synthetic === true && p.text.includes('[建议全局]')),
+    '新增条目应再次提醒'
+  )
+})
+
+test('ensureSuggestGlobalReminder: 无 [建议全局] 条目 → 不注入; tail 非 user → 不注入', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '# 项目规则\n- 本地规则\n')
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages })
+  assert.equal(messages[0].parts.length, 1, '无 [建议全局] 不应注入')
+  // tail 非 user → 不注入
+  files.set(PROJ_MD, '- [建议全局] 一条\n')
+  const user = msgs(1)[0]
+  const assistant = { info: { role: 'assistant' }, parts: [{ type: 'text', text: 'ok' }] }
+  const messages2 = [user, assistant]
+  r.ensureSuggestGlobalReminder({ messages: messages2 })
+  assert.equal(user.parts.length, 1, 'tail 非 user 不应注入')
+})
+
+test('ensureSuggestGlobalReminder: 处理回落后基线重置 → 再涨回重新提醒 (不存历史峰值)', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '- [建议全局] 一条\n- [建议全局] 两条\n')
+  const r = createExperienceReviewer(deps)
+  r.ensureSuggestGlobalReminder({ messages: msgs(1) }) // 首次提醒, 基线=2
+  // 用户处理掉 1 条 (回落 2→1) → 不提醒, 但基线重置为 1
+  files.set(PROJ_MD, '- [建议全局] 一条\n')
+  const m1 = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages: m1 })
+  assert.equal(m1[0].parts.length, 1, '回落后不应重复提醒')
+  // 又新增 1 条 (再涨回 2) → 应重新提醒 (旧逻辑 2>=2 会被吞)
+  files.set(PROJ_MD, '- [建议全局] 一条\n- [建议全局] 新一条\n')
+  const m2 = msgs(1)
+  r.ensureSuggestGlobalReminder({ messages: m2 })
+  assert.ok(
+    m2[0].parts.some((p) => p.synthetic === true && p.text.includes('[建议全局]')),
+    '回落基线重置后, 再涨回应重新提醒'
+  )
+})
+
+test('ensureRecycleReminder: 条目数 ≥100 → 注入检查清理提醒', () => {
+  const { deps, files } = makeDeps()
+  // 100 条 `- ` 开头经验
+  const lines = Array.from({ length: 100 }, (_, i) => `- 经验${i}`)
+  files.set(PROJ_MD, '# 项目规则\n' + lines.join('\n'))
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureRecycleReminder({ messages })
+  const lastUser = messages[messages.length - 1]
+  assert.ok(
+    lastUser.parts.some((p) => p.synthetic === true && p.text.includes('100') && p.text.includes('删除')),
+    '应注入检查清理提醒'
+  )
+})
+
+test('ensureRecycleReminder: 条目数 <100 → 不注入; 清理到 99 → 停止提醒', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, '# 项目规则\n- 经验1\n- 经验2\n')
+  const r = createExperienceReviewer(deps)
+  const messages = msgs(1)
+  r.ensureRecycleReminder({ messages })
+  assert.equal(messages[0].parts.length, 1, '<100 条不应注入')
+  // 清理到 99 (仍 <100 上限) → 判据不满足, 不再提醒
+  files.set(PROJ_MD, Array.from({ length: 99 }, (_, i) => `- 经验${i}`).join('\n'))
+  const messages2 = msgs(1)
+  r.ensureRecycleReminder({ messages: messages2 })
+  assert.equal(messages2[0].parts.length, 1, '压回上限以下不应再提醒')
+})
+
+test('ensureRecycleReminder: 达标即提醒, 不因条数未变而静默 (回归: 基线曾锁死)', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, Array.from({ length: 110 }, (_, i) => `- 经验${i}`).join('\n'))
+  const r = createExperienceReviewer(deps)
+  // 同一条数连续三轮 → 三轮都该提醒 (旧基线逻辑第二轮起 110===110 会永久静默)
+  for (const round of [1, 2, 3]) {
+    const m = msgs(1)
+    r.ensureRecycleReminder({ messages: m })
+    assert.ok(
+      m[0].parts.some((p) => p.synthetic === true && p.text.includes('110')),
+      `第 ${round} 轮: 110 条仍在上限之上, 必须继续提醒`
+    )
+  }
+  // 清理到 100 (仍达标) → 继续提醒
+  files.set(PROJ_MD, Array.from({ length: 100 }, (_, i) => `- 经验${i}`).join('\n'))
+  const m4 = msgs(1)
+  r.ensureRecycleReminder({ messages: m4 })
+  assert.ok(
+    m4[0].parts.some((p) => p.synthetic === true && p.text.includes('100')),
+    '压到恰好 100 仍达标, 应继续提醒'
+  )
+  // 清理到 99 → 才停
+  files.set(PROJ_MD, Array.from({ length: 99 }, (_, i) => `- 经验${i}`).join('\n'))
+  const m5 = msgs(1)
+  r.ensureRecycleReminder({ messages: m5 })
+  assert.equal(m5[0].parts.length, 1, '压到 99 低于上限应停止提醒')
+})
+
+test('ensureRecycleReminder: 只报当前状态与目标状态, 不泄露上限/完成判据', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, Array.from({ length: 110 }, (_, i) => `- 经验${i}`).join('\n'))
+  const r = createExperienceReviewer(deps)
+  const m = msgs(1)
+  r.ensureRecycleReminder({ messages: m })
+  const injected = m[0].parts.find((p) => p.synthetic === true).text
+  // 只给两样: 当前状态 + 目标状态
+  assert.ok(injected.includes('经验条目已达 110 条'), '必须说明当前状态')
+  assert.ok(injected.includes('目标压到 60 条以内'), '必须说明目标状态 (60% × 100)')
+  // 上限是插件内部的触发线, agent 不需要知道
+  assert.ok(!injected.includes('上限'), '不向 agent 暴露上限数值')
+  // 不设完成判据: 没压到目标就是没完成
+  assert.ok(!injected.includes('完成判据'), '不设完成判据, 未达目标就该继续压')
+})
+
+test('ensureRecycleReminder: 非最新 user 消息不注入 (一轮最多一次)', () => {
+  const { deps, files } = makeDeps()
+  files.set(PROJ_MD, Array.from({ length: 110 }, (_, i) => `- 经验${i}`).join('\n'))
+  const r = createExperienceReviewer(deps)
+  // 历史 user 消息 + 后续 assistant 消息 → 不该往历史 user 上注入
+  const messages = [
+    { info: { role: 'user' }, parts: [{ type: 'text', text: '第一条' }] },
+    { info: { role: 'assistant' }, parts: [{ type: 'text', text: '回复' }] },
+  ]
+  r.ensureRecycleReminder({ messages })
+  assert.equal(messages[0].parts.length, 1, '最新消息不是 user 时不注入')
+})
+
+test('ensureGlobalRuleSync: 全局 AGENTS.md 已有规则句 → 不重复写入', () => {
+  const { deps, files, logs } = makeDeps()
+  files.set(GLOBAL_MD, '# 全局规则\n- 项目 AGENTS.md 出现 `[建议全局]` 前缀的经验条目时, 当面向用户确认是否转全局: 用户否 → 删标记留项目; 用户是 → 迁全局并删原条目\n')
+  const r = createExperienceReviewer(deps)
+  r.ensureGlobalRuleSync({ messages: msgs(1) })
+  assert.equal(files.get(GLOBAL_MD).includes('用户是 → 迁全局并删原条目'), true)
+  assert.ok(!logs.some((l) => l.startsWith('GLOBAL_RULE_WRITE')), '已有规则句不应写入')
+})
+
+test('ensureGlobalRuleSync: 全局 AGENTS.md 缺少规则句 → 自动追加写入 (文件尾补换行)', () => {
+  const { deps, files, logs } = makeDeps()
+  files.set(GLOBAL_MD, '# 全局规则\n- 其它条目')
+  const r = createExperienceReviewer(deps)
+  r.ensureGlobalRuleSync({ messages: msgs(1) })
+  const content = files.get(GLOBAL_MD)
+  assert.ok(content.includes('用户是 → 迁全局并删原条目'), '缺规则句应自动补写')
+  assert.ok(content.endsWith('\n'), '写入后应以换行结尾')
+  assert.ok(logs.some((l) => l.startsWith('GLOBAL_RULE_WRITE')), '应有写入日志')
+  // 再次调用 → 检测命中 → 不再重复写入
+  r.ensureGlobalRuleSync({ messages: msgs(1) })
+  const writeCount = logs.filter((l) => l.startsWith('GLOBAL_RULE_WRITE')).length
+  assert.equal(writeCount, 1, '检测命中后不应重复写入')
+})
+
+test('ensureGlobalRuleSync: 全局 AGENTS.md 不存在 → 创建并写入', () => {
+  const { deps, files } = makeDeps()
+  const r = createExperienceReviewer(deps) // GLOBAL_MD 未在 files 中 → exists=false
+  r.ensureGlobalRuleSync({ messages: msgs(1) })
+  assert.ok(files.has(GLOBAL_MD), '缺文件应创建全局 AGENTS.md')
+  assert.ok(files.get(GLOBAL_MD).includes('用户是 → 迁全局并删原条目'))
 })

@@ -353,11 +353,38 @@ function writeCursor(cursorPath, cursor) {
   }
 }
 
+/** 项目概述标记: AGENTS.md 顶部首行格式, 前 50 行内检测 */
+const OVERVIEW_MARKER = '> **项目概述**: '
+/** 缺概述时向主 agent 注入的提醒 (必须执行, 不允许忽略) */
+const OVERVIEW_REMINDER =
+  '【必须执行】本项目 AGENTS.md 缺少项目概述, 这是必须完成的事项。立即将一句话概述写入 AGENTS.md 顶部首行, 格式 `> **项目概述**: <一句话>`; 不得跳过、不得推迟、不得找理由忽略, 完成补写后才算满足要求。'
+/** [建议全局] 经验提示: 项目 AGENTS.md 出现该前缀条目时, 主 agent 须询问用户去留 */
+const SUGGEST_GLOBAL_MARKER = '[建议全局] '
+/** 经验回收阈值: AGENTS.md 条目数 ≥ 此值 → 提醒主 agent 检查清理 */
+const RECYCLE_THRESHOLD = 100
+/** 回收压缩目标比例: 提醒后压到「上限 × 该比例」以内 (用户定 60%), 防止只压到刚好低于上限 */
+const RECYCLE_TARGET_RATIO = 0.6
+/** 动态计算的压缩目标条数 (上限 100 → 目标 60) */
+function recycleTargetCount() {
+  return Math.max(1, Math.floor(RECYCLE_THRESHOLD * RECYCLE_TARGET_RATIO))
+}
+/** 统计 AGENTS.md 中 `- ` 开头的一行经验条目数 */
+function countMdEntries(content) {
+  return content.split('\n').filter((line) => line.trim().startsWith('- ')).length
+}
+/** 全局规则句: 全局 AGENTS.md 缺这句时由插件自动补写 (用户批准: 有则不管, 无则自动写入) */
+const SUGGEST_GLOBAL_RULE =
+  '- 项目 AGENTS.md 出现 `[建议全局]` 前缀的经验条目时, 当面向用户确认是否转全局: 用户否 → 删标记留项目; 用户是 → 迁全局并删原条目'
+/** 检测子串: 规则句核心短语, 用户微调措辞保留语义也能命中, 防重复写入 */
+const SUGGEST_GLOBAL_RULE_KEY = '出现 `[建议全局]` 前缀的经验条目时'
+
 /**
  * 构建 subagent 提示词: 对话记录原文在前, 提取规则在最末尾。
  * 规则部分全固定 → 前缀 = 对话原文 (与主会话一致), 规则注入不打断前缀缓存 (KV cache 友好)。
+ * v2.2 规则: 排除 Claude 同类硬排除 + scope 默认 project + 疑似全局 [建议全局] 标记
+ * (skill 专属经验不提取, subagent 不再直写全局)。
  */
-function buildSubagentPrompt(messages) {
+function buildSubagentPrompt(messages, projectOverview = '', entryCount = 0) {
   const { turns } = groupIntoTurns(messages)
   if (!turns.length) return ''
   const transcript = turns
@@ -368,18 +395,28 @@ function buildSubagentPrompt(messages) {
     })
     .join('\n\n')
   // 上下文原文在前, 提取规则在最末尾 (规则固定, 前缀=对话原文 → KV cache 一致)
+  const identity = projectOverview
+    ? `===== 项目身份 =====\n你正在为以下项目提取经验: ${projectOverview}\n\n`
+    : ''
   return (
+    identity +
     `===== 对话记录 =====\n${transcript}\n\n` +
     `===== 提取任务 =====\n` +
     `你是经验提取器。阅读上方对话记录, 提取值得沉淀为经验的内容。\n` +
     `规则:\n` +
-    `1. simple: 一句话能说明白的 规则/偏好/事实/教训, 单条 ≤50 字单句。scope: global=跨项目通用, 否则 project。\n` +
-    `2. complex: 需多行才说得清的 可复用知识/流程。字段 title/description/content/scope/type。` +
-    `description 以 "使用时机: " 开头; type ∈ dev/research/data/process/negative。\n` +
-    `3. 不重复: 相同或高度相似内容只保留一条。\n` +
-    `4. 无内容 → 输出空数组, 不要编造。\n` +
+    `1. simple: 一句话能说明白的 规则/偏好/事实/教训, 单条 ≤50 字单句。scope 一律 project (写入项目 AGENTS.md)。\n` +
+    `2. 归属 (suggestGlobal): 仅当"主语是用户本人跨项目偏好"或"工具链通用坑(与任何项目无关)"时 suggestGlobal=true; 拿不准一律 false。\n` +
+    `3. 排除 (以下绝不提取): 能从项目代码/文档推导出的信息; 当次任务的一次性安排(如"先出5张试探"); ` +
+    `特定 skill/领域专属经验(如 job-hunter 判岗、画图风格规则); 已存过/高度相似内容。\n` +
+    `4. complex: 需多行才说得清的 可复用知识/流程。字段 title/description/content/scope/type。` +
+    `description 以 "使用时机: " 开头; type ∈ dev/research/data/process/negative。` +
+    `scope: project=默认, global=跨项目通用(仅限用户偏好/工具链坑)。\n` +
+    `5. 总判据: 只有"未来对话还用得上"的才提取。\n` +
+    `6. 容量: 项目 AGENTS.md 经验条目上限 ${RECYCLE_THRESHOLD} 条, 当前 ${entryCount} 条。` +
+    `本条仅作参考, 不限制提取: 达上限后主 agent 会收到清理提醒, 但仍按上述规则正常提取, 不要自行禁用 simple 输出。\n` +
+    `7. 无内容 → 输出空数组, 不要编造。\n` +
     `只输出 JSON (不要 markdown 代码块包裹, 不要其他文字):\n` +
-    `{"simple":[{"scope":"project","text":"..."}],"complex":[]}`
+    `{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"complex":[]}`
   )
 }
 
@@ -399,7 +436,11 @@ function extractJsonBlock(text) {
   }
 }
 
-/** 解析 subagent 输出 → {simple:[{scope,text}], complex:[...]} */
+/**
+ * 解析 subagent 输出 → {simple:[{scope,suggestGlobal,text}], complex:[...]}
+ * v2.2: 取消直写全局 — scope 一律 project; suggestGlobal 标记疑似全局条目
+ * (subagent 输出 suggestGlobal=true, 或兼容旧格式 scope=global → 归一为 suggestGlobal)。
+ */
 function parseReviewOutput(stdout) {
   const json = extractJsonBlock(stdout)
   if (!json) return { simple: [], complex: [] }
@@ -407,7 +448,8 @@ function parseReviewOutput(stdout) {
     ? json.simple
         .filter((e) => e && typeof e.text === 'string' && e.text.trim())
         .map((e) => ({
-          scope: e.scope === 'global' ? 'global' : 'project',
+          scope: 'project',
+          suggestGlobal: e.suggestGlobal === true || e.scope === 'global',
           text: e.text.trim(),
         }))
     : []
@@ -585,10 +627,26 @@ function createExperienceReviewer(deps) {
     queryExp = queryExperiences,
     projectIdFn = projectIdFromCwd,
     openDb = (path) => openSqlite(path, { readOnly: true }),
+    configFile = join(directory, '.experience-reviewer', 'config.json'),
   } = deps ?? {}
 
   /** 触发器状态 (只认项目路径 → cursor 文件持久化; session 无关) */
   let reviewInFlight = false
+
+  /**
+   * 按项目开关: <项目根>/.experience-reviewer/config.json 里 {"enabled": false} 关闭本项目提取。
+   * 缺省 (无文件 / enabled 未定义 / enabled!==false) = 开。用注入的 fs (测试可 mock)。
+   * 原因: 提取会 spawn subagent 消耗 token (即使 cache 命中 99% 也非免费), 不值得的项目在配置中关闭。
+   */
+  function isDisabled() {
+    try {
+      if (!exists(configFile)) return false
+      const cfg = JSON.parse(read(configFile, 'utf8'))
+      return cfg && typeof cfg === 'object' && cfg.enabled === false
+    } catch {
+      return false // 配置损坏 → 视为开启 (不误伤)
+    }
+  }
 
   /** 本轮用户消息条数 (回合计数基准) */
   function userMessageCount(messages) {
@@ -598,6 +656,22 @@ function createExperienceReviewer(deps) {
   /** 项目 cursor 路径 */
   function cursorPath() {
     return join(directory, CURSOR_FILE)
+  }
+
+  /** 读项目 AGENTS.md 概述 (前 50 行匹配 OVERVIEW_MARKER)。无概述 → '' */
+  function readProjectOverview() {
+    const mdPath = join(directory, 'AGENTS.md')
+    try {
+      if (!exists(mdPath)) return ''
+      const line = read(mdPath, 'utf8')
+        .split('\n')
+        .slice(0, 50)
+        .find((l) => l.includes(OVERVIEW_MARKER))
+      if (!line) return ''
+      return line.slice(OVERVIEW_MARKER.length).trim()
+    } catch {
+      return ''
+    }
   }
 
   /** 读 cursor: 用注入的 fs (测试可 mock)。无文件/损坏 → null */
@@ -629,6 +703,10 @@ function createExperienceReviewer(deps) {
   async function fireReview() {
     if (!directory) {
       log(`REVIEW_SKIP reason=no-directory`)
+      return false
+    }
+    if (isDisabled()) {
+      log(`REVIEW_SKIP reason=disabled-by-config`)
       return false
     }
     const projectId = projectIdFn(directory)
@@ -673,11 +751,20 @@ function createExperienceReviewer(deps) {
     // prompt 超长时按轮次从尾部截断 (游标只推进到已交付的最后一个完整轮次, 不丢数据)
     let promptText
     let deliveredTurns = turnsGroup.turns
+    const projectOverview = readProjectOverview()
+    // 当前 AGENTS.md 条目数 → 注入提取提示词容量参考行 (只作参考, 不限制提取)
+    const mdPath = join(directory, 'AGENTS.md')
+    let entryCount = 0
     try {
-      promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]))
+      entryCount = exists(mdPath) ? countMdEntries(read(mdPath, 'utf8')) : 0
+    } catch (error) {
+      log(`MD_COUNT_FAIL path=${mdPath} error=${String(error)}`)
+    }
+    try {
+      promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]), projectOverview, entryCount)
       while (promptText.length > MAX_PROMPT_CHARS && deliveredTurns.length > 1) {
         deliveredTurns = deliveredTurns.slice(0, -1)
-        promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]))
+        promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]), projectOverview, entryCount)
         log(`REVIEW_TRUNCATE turned turns=${deliveredTurns.length} len=${promptText.length}`)
       }
       if (promptText.length > MAX_PROMPT_CHARS) {
@@ -767,6 +854,7 @@ function createExperienceReviewer(deps) {
    */
   function handleTransform({ messages = [] } = {}) {
     if (!Array.isArray(messages) || messages.length === 0) return
+    if (isDisabled()) return // 按项目关闭 → 完全跳过 (零开销, 不写 cursor 不触发)
     const userCount = userMessageCount(messages)
     const cursor = readCursorLocal() ?? {}
     const lastReviewRound = typeof cursor.lastReviewRound === 'number' ? cursor.lastReviewRound : 0
@@ -822,53 +910,201 @@ function createExperienceReviewer(deps) {
     })
   }
 
-  /** 简单经验写入 AGENTS.md (按 scope 分组, 去重 + 大小上限) */
+  /**
+   * 简单经验写入项目 AGENTS.md (v2.2: 取消 subagent 直写全局)。
+   * 全部写项目 MD; 疑似全局条目加 `[建议全局] ` 前缀, 由主 agent 当面向用户确认后迁全局。
+   * 去重按原文 (前缀不参与); 大小上限保持。
+   */
   function writeSimpleEntries(entries) {
     if (!entries.length) return
-    const grouped = { project: [], global: [] }
-    for (const e of entries) grouped[e.scope]?.push(e.text)
-    for (const scope of ['project', 'global']) {
-      const path = scope === 'global' ? globalAgentsPath : join(directory, 'AGENTS.md')
-      if (!path) {
-        log(`MD_SKIP scope=${scope} reason=no-path`)
+    const path = join(directory, 'AGENTS.md')
+    let existing = ''
+    try {
+      existing = exists(path) ? read(path, 'utf8') : ''
+    } catch (error) {
+      log(`MD_READ_FAIL path=${path} error=${String(error)}`)
+      return
+    }
+    let added = ''
+    for (const e of entries) {
+      const text = e?.text
+      if (!text) continue
+      if (text.length > SIMPLE_MAX_CHARS) {
+        // 护栏: 超长 simple 拒绝落盘 (提示词已要求 ≤50 字, 兜底防 LLM 百字长句冒充)
+        log(`MD_TOO_LONG chars=${text.length} max=${SIMPLE_MAX_CHARS} skipped="${text.slice(0, 30)}…"`)
         continue
       }
-      const texts = grouped[scope]
-      if (!texts.length) continue
-      let existing = ''
-      try {
-        existing = exists(path) ? read(path, 'utf8') : ''
-      } catch (error) {
-        log(`MD_READ_FAIL scope=${scope} path=${path} error=${String(error)}`)
+      if (existing.includes(text) || added.includes(text)) continue // 去重 (原文)
+      const line = `- ${e.suggestGlobal ? `[建议全局] ${text}` : text}`
+      if ((existing + added + line).length > maxMdBytes) {
+        log(`MD_FULL maxBytes=${maxMdBytes} skipped="${text}"`)
         continue
       }
-      let added = ''
-      for (const text of texts) {
-        if (!text) continue
-        if (text.length > SIMPLE_MAX_CHARS) {
-          // 护栏: 超长 simple 拒绝落盘 (提示词已要求 ≤50 字, 兜底防 LLM 百字长句冒充)
-          log(`MD_TOO_LONG scope=${scope} chars=${text.length} max=${SIMPLE_MAX_CHARS} skipped="${text.slice(0, 30)}…"`)
-          continue
-        }
-        if (existing.includes(text) || added.includes(text)) continue // 去重
-        const line = `- ${text}`
-        if ((existing + added + line).length > maxMdBytes) {
-          log(`MD_FULL scope=${scope} maxBytes=${maxMdBytes} skipped="${text}"`)
-          continue
-        }
-        added += line + '\n'
+      added += line + '\n'
+    }
+    if (!added) {
+      log(`MD_NOOP entries=${entries.length} reason=all-duplicate-or-full`)
+      return
+    }
+    try {
+      const sep = existing && !existing.endsWith('\n') ? '\n' : ''
+      write(path, existing + sep + added, 'utf8')
+      log(`MD_WRITE path=${path} newEntries=${entries.length} bytes=${(existing + sep + added).length}`)
+    } catch (error) {
+      log(`MD_WRITE_FAIL path=${path} error=${String(error)}`)
+    }
+  }
+
+  /**
+   * 项目概述提醒 (v2.2): 读项目 AGENTS.md 前 50 行, 匹配 `> **项目概述**: ` 标记。
+   * 缺 → 首次注入一句话提醒 (记 cursor.overviewPrompted 防刷屏);
+   * 补写后 → 记 cursor.hasOverview 永久停提醒。
+   * 不能用 `# 标题` 判断 (全局 AGENTS.md 首行就是 `# ...` 会误判)。
+   */
+  function ensureOverviewReminder({ messages = [] } = {}) {
+    if (isDisabled()) return
+    const cursor = readCursorLocal(cursorPath()) ?? {}
+    if (cursor.hasOverview) return
+    const mdPath = join(directory, 'AGENTS.md')
+    let head = ''
+    try {
+      head = exists(mdPath) ? read(mdPath, 'utf8') : ''
+    } catch (error) {
+      log(`OVERVIEW_READ_FAIL path=${mdPath} error=${String(error)}`)
+      return
+    }
+    const hasOverview = head
+      .split('\n')
+      .slice(0, 50)
+      .some((line) => line.includes(OVERVIEW_MARKER))
+    if (hasOverview) {
+      if (!cursor.hasOverview) {
+        writeCursorLocal(cursorPath(), { ...cursor, hasOverview: true })
+        log(`OVERVIEW_OK hasOverview=true`)
       }
-      if (!added) {
-        log(`MD_NOOP scope=${scope} entries=${texts.length} reason=all-duplicate-or-full`)
-        continue
-      }
-      try {
-        const sep = existing && !existing.endsWith('\n') ? '\n' : ''
-        write(path, existing + sep + added, 'utf8')
-        log(`MD_WRITE scope=${scope} path=${path} newEntries=${texts.length} bytes=${(existing + sep + added).length}`)
-      } catch (error) {
-        log(`MD_WRITE_FAIL scope=${scope} path=${path} error=${String(error)}`)
-      }
+      return
+    }
+    if (cursor.overviewPrompted) return // 已提醒过, 不重复刷屏
+    const lastUser = [...messages]
+      .reverse()
+      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+    if (!lastUser) return
+    // 最小修改: 只在用户新消息到达的 transform 注入; assistant 生成/工具循环阶段跳过 (否则自己抢先注入锁死)
+    if (messages[messages.length - 1] !== lastUser) return
+    // 与 task-context-injector 同款: synthetic part 追加到主会话最后一条 user 消息
+    lastUser.parts.push({ type: 'text', text: `\n\n${OVERVIEW_REMINDER}`, synthetic: true })
+    writeCursorLocal(cursorPath(), { ...cursor, overviewPrompted: true })
+    log(`OVERVIEW_REMINDER injected once`)
+  }
+
+  /**
+   * [建议全局] 询问提醒 (v2.2): 扫描项目 AGENTS.md 中 `- [建议全局] ` 开头的条目。
+   * 有 → 注入提醒, 让主 agent 当面向用户询问: 升级→移入全局 AGENTS.md; 不升级→删除前缀。
+   * 防刷屏: cursor.suggestGlobalPromptedCount 存「上次提醒时的条数」; 回落(处理/清零)时重置基线,
+   * 条数涨回超过基线才重新提醒 (不存历史峰值, 防清理后再涨回同值被静默吞掉)。
+   */
+  function ensureSuggestGlobalReminder({ messages = [] } = {}) {
+    if (isDisabled()) return
+    const mdPath = join(directory, 'AGENTS.md')
+    let content = ''
+    try {
+      content = exists(mdPath) ? read(mdPath, 'utf8') : ''
+    } catch (error) {
+      log(`SUGGEST_GLOBAL_READ_FAIL path=${mdPath} error=${String(error)}`)
+      return
+    }
+    const count = content
+      .split('\n')
+      .filter((line) => line.trim().startsWith('- ' + SUGGEST_GLOBAL_MARKER)).length
+    const cursor = readCursorLocal(cursorPath()) ?? {}
+    const lastCount = cursor.suggestGlobalPromptedCount ?? 0
+    // 回落 (含清零) → 重置基线: 用户处理过部分条目, 下次新增时能再次提醒
+    if (count < lastCount) {
+      writeCursorLocal(cursorPath(), { ...cursor, suggestGlobalPromptedCount: count })
+      return
+    }
+    if (count === 0) return
+    if (count === lastCount) return // 同值不重复提醒
+    const lastUser = [...messages]
+      .reverse()
+      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+    if (!lastUser) return
+    if (messages[messages.length - 1] !== lastUser) return
+    const reminder =
+      `【必须执行】项目 AGENTS.md 中有 ${count} 条以 \`[建议全局] \` 开头的经验。` +
+      `请逐条当面向用户询问是否升级为全局经验: 用户同意 → 移动到全局 AGENTS.md; 不同意 → 删除 \`[建议全局] \` 前缀。` +
+      `不得跳过、不得推迟, 处理完所有条目才算满足要求。`
+    lastUser.parts.push({ type: 'text', text: `\n\n${reminder}`, synthetic: true })
+    writeCursorLocal(cursorPath(), { ...cursor, suggestGlobalPromptedCount: count })
+    log(`SUGGEST_GLOBAL_REMINDER injected count=${count}`)
+  }
+
+  /**
+   * 经验回收提醒 (v2.3/v2.4): 项目 AGENTS.md 经验条目数 ≥ RECYCLE_THRESHOLD (100) 时,
+   * 注入提醒让主 agent 按 7 个方向逐条清理 (删除/合并/迁移)。
+   * 判据只有上限一条: 达标就一直提醒, 压回上限以下自动停。
+   * (v2.3 前曾用 cursor.recyclePromptedCount 存「上次提醒时的条数」做同值静默,
+   *  回落重置时又把基线写成当前值 → 清理到仍超上限时被自己锁死, 已删除该层。)
+   * 限流靠「最新一条必须是 user 消息」, 天然一轮最多注入一次。
+   */
+  function ensureRecycleReminder({ messages = [] } = {}) {
+    if (isDisabled()) return
+    const mdPath = join(directory, 'AGENTS.md')
+    let content = ''
+    try {
+      content = exists(mdPath) ? read(mdPath, 'utf8') : ''
+    } catch (error) {
+      log(`RECYCLE_READ_FAIL path=${mdPath} error=${String(error)}`)
+      return
+    }
+    const count = countMdEntries(content)
+    if (count < RECYCLE_THRESHOLD) return
+    const lastUser = [...messages]
+      .reverse()
+      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+    if (!lastUser) return
+    if (messages[messages.length - 1] !== lastUser) return
+    const target = recycleTargetCount()
+    // 目录名做项目标识: 尾部分隔符要一并剥掉 (根目录 '/' → 空)
+    const projectName = directory.split(/[\\/]/).filter(Boolean).pop() ?? '未知项目'
+    const reminder =
+      `【${projectName}】*必须执行* 项目 AGENTS.md 经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
+      `逐条过现有条目, 命中即处理 (删除/合并/迁移), 每条给出原文和理由:\n` +
+      `1. 不符合存储门槛 → 删。门槛 = 用户偏好 / 用户纠正 / 无法从代码推导的项目决策 / 反复踩的工程坑; skill 与领域专属经验不在门槛内\n` +
+      `2. 已解决的问题\n` +
+      `3. 重复/同义\n` +
+      `4. 作用域错位 (与本项目无关的工具链坑)\n` +
+      `5. 同一主题拆成多条\n` +
+      `6. 低频场景占常驻\n` +
+      `7. 依赖环境已变化\n` +
+      `约束: 删除系统文件或全局 AGENTS.md 前先向用户说明; 完成后回报原条数 → 新条数, 以及各类方向各删/合并/迁了几条; 不得跳过推迟。`
+    lastUser.parts.push({ type: 'text', text: `\n\n${reminder}`, synthetic: true })
+    log(`RECYCLE_REMINDER injected count=${count}`)
+  }
+
+  /**
+   * 全局规则句同步 (v2.2): 全局 AGENTS.md 缺 `[建议全局]` 确认规则句时自动补写。
+   * 用户批准方案: 有则不管 (检测到即跳过), 无则自动写入 (一次性, 写入后下次检测命中不再重复)。
+   * 与 reminder 不同: 不注入对话, 直接落盘全局文件。
+   */
+  function ensureGlobalRuleSync({ messages = [] } = {}) {
+    if (isDisabled()) return
+    const globalMd = globalAgentsPath
+    let content = ''
+    try {
+      content = exists(globalMd) ? read(globalMd, 'utf8') : ''
+    } catch (error) {
+      log(`GLOBAL_RULE_READ_FAIL path=${globalMd} error=${String(error)}`)
+      return
+    }
+    if (content.includes(SUGGEST_GLOBAL_RULE_KEY)) return // 已有规则句(或保留语义的微调版本), 不管
+    try {
+      // 追加到全局 AGENTS.md 末尾; 已有内容且不以换行结尾时先补换行, 防止段落粘连
+      const sep = content && !content.endsWith('\n') ? '\n' : ''
+      write(globalMd, content + sep + SUGGEST_GLOBAL_RULE + '\n', 'utf8')
+      log(`GLOBAL_RULE_WRITE path=${globalMd}`)
+    } catch (error) {
+      log(`GLOBAL_RULE_WRITE_FAIL path=${globalMd} error=${String(error)}`)
     }
   }
 
@@ -877,8 +1113,13 @@ function createExperienceReviewer(deps) {
     fireReview,
     parseReviewOutput,
     writeSimpleEntries,
+    ensureOverviewReminder,
+    ensureSuggestGlobalReminder,
+    ensureRecycleReminder,
+    ensureGlobalRuleSync,
     readCursor: readCursorLocal,
     writeCursor: writeCursorLocal,
+    isDisabled,
   }
 }
 
@@ -905,7 +1146,12 @@ const plugin = {
     const reviewer = createExperienceReviewer({ directory })
     return {
       'experimental.chat.messages.transform': async (input, output) => {
+        // 职责分离: handleTransform 只做触发检测 (零注入), 其余四个提醒单独注入
         reviewer.handleTransform({ messages: output?.messages })
+        reviewer.ensureOverviewReminder({ messages: output?.messages })
+        reviewer.ensureSuggestGlobalReminder({ messages: output?.messages })
+        reviewer.ensureRecycleReminder({ messages: output?.messages })
+        reviewer.ensureGlobalRuleSync({ messages: output?.messages })
       },
     }
   },

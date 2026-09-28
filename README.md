@@ -87,7 +87,7 @@ OpencodeOptimize/
 │   ├── package.json
 │   ├── README.md
 │   └── test/
-│       ├── experience-reviewer.test.mjs  # node:test 单测 45/45
+│       ├── experience-reviewer.test.mjs  # node:test 单测 70/70
 │       └── bun-smoke.test.mjs            # bun 环境冒烟 5/5
 ├── config-backup/              # opencode 全局配置备份（脱敏版，API key 已掩码）
 │   └── opencode.jsonc
@@ -106,7 +106,7 @@ OpencodeOptimize/
 |---|---|---|---|---|
 | `watchdog/` | 治卡死 | 会话数小时卡 Thinking（busy 无产出无工具执行）→ 自动 `abort` 释放会话。GitHub issue #48675 / #49033 的插件级缓解 | ✅ 实现 + 真实验证通过 (2026-09-15) | [watchdog/README.md](watchdog/README.md) |
 | `task-context-injector/` | 治上下文隔离 | 子代理上下文隔离导致缺背景就动手 → 派发时向子代理注入"派活交接规范"（项目/业务背景 + 输出结构约束） | ✅ v3 实现（messages.transform 机制） | [task-context-injector/README.md](task-context-injector/README.md) |
-| `experience-reviewer/` | 治经验流失 | 长对话里沉淀的可复用经验没人抽取 → 每 3 轮/10min 触发 subagent 提取，simple 写 AGENTS.md，complex 入 OCM 经验表 | ✅ v2 实现（subagent + memory.db 游标 + OCM HTTP API） | [experience-reviewer/README.md](experience-reviewer/README.md) |
+| `experience-reviewer/` | 治经验流失 | 长对话里沉淀的可复用经验没人抽取 → 每 3 轮/10min 触发 subagent 提取，simple 写 AGENTS.md，complex 入 OCM 经验表；AGENTS.md 条数超过 100 即持续提醒主 agent 按 7 个方向压到 60 条（提取不中断） | ✅ v2.4 实现（subagent + opencode.db 游标 + 容量回收） | [experience-reviewer/README.md](experience-reviewer/README.md) |
 | `config-backup/` | 备份 | 全局配置丢失后项目内可直接恢复 | ✅ 已同步（脱敏版） | [config-backup/opencode.jsonc](config-backup/opencode.jsonc) |
 | `scripts/` | 运维 | 部署后一键验证 | ✅ check-watchdog 实测通过 | — |
 
