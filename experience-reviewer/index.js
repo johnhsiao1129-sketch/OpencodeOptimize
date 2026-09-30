@@ -414,7 +414,8 @@ function buildSubagentPrompt(messages, projectOverview = '', entryCount = 0) {
     `5. 总判据: 只有"未来对话还用得上"的才提取。\n` +
     `6. 容量: 项目 AGENTS.md 经验条目上限 ${RECYCLE_THRESHOLD} 条, 当前 ${entryCount} 条。` +
     `本条仅作参考, 不限制提取: 达上限后主 agent 会收到清理提醒, 但仍按上述规则正常提取, 不要自行禁用 simple 输出。\n` +
-    `7. 无内容 → 输出空数组, 不要编造。\n` +
+    `7. 准入门槛: 经验条目必须是「可参考、可执行的规范」(规则/偏好/流程); 拒绝单纯事实性描述(路径/版本/API 行为等可从代码/文档推导的内容), 即使重复出现也不入库, 避免库膨胀失效。\n` +
+    `8. 无内容 → 输出空数组, 不要编造。\n` +
     `只输出 JSON (不要 markdown 代码块包裹, 不要其他文字):\n` +
     `{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"complex":[]}`
   )
@@ -956,9 +957,12 @@ function createExperienceReviewer(deps) {
   }
 
   /**
-   * 项目概述提醒 (v2.2): 读项目 AGENTS.md 前 50 行, 匹配 `> **项目概述**: ` 标记。
-   * 缺 → 首次注入一句话提醒 (记 cursor.overviewPrompted 防刷屏);
-   * 补写后 → 记 cursor.hasOverview 永久停提醒。
+   * 项目概述提醒 (v2.2 → v2.5 改 persistent): 读项目 AGENTS.md 前 50 行,
+   * 匹配 `> **项目概述**: ` 标记。缺 → 每次 user-turn transform 都注入提醒
+   * (用户要求「未写入就一直提醒直到写入为止」); 补写后 → 记 cursor.hasOverview 永久停。
+   * v2.5 移除 one-shot (cursor.overviewPrompted 字段废弃): 旧设计为「首次提醒后永不再提醒」,
+   * 导致 task() 派生的 subagent session 抢先触发一次后, 主 agent 永久收不到这条提示,
+   * 与「未写入就一直提醒」的设计意图冲突。
    * 不能用 `# 标题` 判断 (全局 AGENTS.md 首行就是 `# ...` 会误判)。
    */
   function ensureOverviewReminder({ messages = [] } = {}) {
@@ -984,17 +988,16 @@ function createExperienceReviewer(deps) {
       }
       return
     }
-    if (cursor.overviewPrompted) return // 已提醒过, 不重复刷屏
+    // v2.5: 去掉 cursor.overviewPrompted one-shot 限制, 只要未写入每次 user-turn 都注入
     const lastUser = [...messages]
       .reverse()
       .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
     if (!lastUser) return
-    // 最小修改: 只在用户新消息到达的 transform 注入; assistant 生成/工具循环阶段跳过 (否则自己抢先注入锁死)
+    // 最小修改: 只在用户新消息到达的 transform 注入; assistant 生成/工具循环阶段跳过
     if (messages[messages.length - 1] !== lastUser) return
-    // 与 task-context-injector 同款: synthetic part 追加到主会话最后一条 user 消息
+    // 与 task-context-injector 同款: synthetic part 追加到最后一条 user 消息
     lastUser.parts.push({ type: 'text', text: `\n\n${OVERVIEW_REMINDER}`, synthetic: true })
-    writeCursorLocal(cursorPath(), { ...cursor, overviewPrompted: true })
-    log(`OVERVIEW_REMINDER injected once`)
+    log(`OVERVIEW_REMINDER injected (recurring until written)`)
   }
 
   /**

@@ -43,9 +43,11 @@ hook 检测到 轮次/时间 触发 ──→  spawn `opencode run --pure` (suba
 - **提取排除规则（v2.2）**：subagent 提示词内置硬排除——能从代码/文档推导的信息、当次任务一次性安排、
   特定 skill/领域专属经验（如 job-hunter 判岗、画图风格）、已存过/高度相似内容，一律不提取；
   归属拿不准默认 project，不猜全局
-- **项目概述提醒（v2.2）**：`server` 层追加 `ensureOverviewReminder`——读 `<项目根>/AGENTS.md` 前 50 行，
-  匹配 `> **项目概述**: ` 标记（顶部首行格式）；缺 → 向主 agent 注入一次提醒（cursor `overviewPrompted`
-  防刷屏），补写后验证到 → cursor `hasOverview=true` 永久停；**禁用 `# 标题` 判断**（全局 AGENTS.md
+- **项目概述提醒（v2.2 → v2.5 改 persistent）**：`server` 层追加 `ensureOverviewReminder`——读 `<项目根>/AGENTS.md` 前 50 行，
+  匹配 `> **项目概述**: ` 标记（顶部首行格式）；缺 → **每次 user-turn transform 都注入提醒**
+  （v2.5 移除 cursor `overviewPrompted` one-shot 限制，废弃该字段——旧设计让 task() 派生的 subagent
+  session 抢先触发一次后主 agent 永久收不到，与「未写入就一直提醒」的设计意图冲突），
+  补写后验证到 → cursor `hasOverview=true` 永久停；**禁用 `# 标题` 判断**（全局 AGENTS.md
   首行即 `# ...` 会误判）。与 `handleTransform` 零注入职责分离
 - **容量回收提醒（v2.3，v2.4 调整为 100）**：条数 ≥ `RECYCLE_THRESHOLD`（100）时向主 agent 注入压缩指令，目标
   `Math.floor(100 × RECYCLE_TARGET_RATIO)` = 60 条（比例常量可调，不写死数字）。
@@ -128,8 +130,8 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
 2. **触发**：对话 ≥3 轮后 log 出现 `TRIGGER ... roundHit=true`
 3. **回顾链路**：log 出现 `REVIEW_START` → `REVIEW_PARSE ok=true` → `MD_WRITE` / `REVIEW_DONE`
    （subagent 会对新消息总结；无新消息则 `REVIEW_SKIP`）
-4. **项目概述**：项目 AGENTS.md 缺 `> **项目概述**: ` 首行时，log 出现 `OVERVIEW_REMINDER injected once`
-   （只注入一次；补写后下轮 `OVERVIEW_OK hasOverview=true` 永久停）
+4. **项目概述**：项目 AGENTS.md 缺 `> **项目概述**: ` 首行时，log 出现 `OVERVIEW_REMINDER injected (recurring until written)`
+   （v2.5 persistent：每次 user-turn transform 都注入，不再 one-shot；补写后下轮 `OVERVIEW_OK hasOverview=true` 永久停）
 5. **复杂经验**：OCM API 就绪后，log 出现 `COMPLEX_STORED`；未就绪则 `EXP_COMPLEX_API_NOT_READY`
    （且 cursor 不推进，下次重试）
 6. **单元测试**：`node --test test/experience-reviewer.test.mjs` 70/70
@@ -146,8 +148,8 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
   text 分区聚合，cursor 无缝兼容）
 - v2.2（2026-09-28）：取消 subagent 直写全局——simple 全部写项目 AGENTS.md，疑似全局加 `[建议全局] ` 前缀，
   由主 agent 当面向用户确认迁全局（全局 AGENTS.md 已加确认规则）；提示词内置硬排除规则（代码可推导/
-  一次性安排/skill 专属/已存过 不提取）；新增项目概述机制（`> **项目概述**: ` 首行标记，缺则提醒一次，
-  补写后永久停）；单元测试 52/52 全绿（真实 node:sqlite 内存库模拟 opencode.db 三表）
+  一次性安排/skill 专属/已存过 不提取）；新增项目概述机制（`> **项目概述**: ` 首行标记，缺则每次 user-turn 都提醒，
+  补写后永久停；v2.5 移除 one-shot）；单元测试 52/52 全绿（真实 node:sqlite 内存库模拟 opencode.db 三表）
 - v2.3（2026-09-28）：容量回收机制——`RECYCLE_TARGET_RATIO = 0.6` 动态算出压缩目标，
   回收提醒正文升级为 7 个可判定清理方向 + 正向门槛白名单 + 硬约束（替换原"无用/重复"模糊表述）；
   代码判据简化为「超过上限就提醒」，删除会锁死自身的 cursor 条数基线；注入正文只报当前状态与
@@ -155,4 +157,8 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
 - v2.4（2026-09-28）：上限 50 → **100**（目标自动 60）；**移除达上限禁止新增机制**——`buildSubagentPrompt`
   容量行改为只作参考不限制提取，删掉 `prune` 字段的提示、解析与 schema 声明（清理设计是「给 7 条规则、
   主 agent 自行判断」，不需要旁路产出清单）。单测 70/70 全绿、bun smoke 5/5
+- **v2.5（2026-10-01）**：项目概述提醒 one-shot → **persistent**——移除 `cursor.overviewPrompted` 字段（废弃），
+  缺概述时每次 user-turn transform 都注入提醒，直到补写到 `> **项目概述**: ` 才永久停。修复 mission id=200
+  根因：旧 one-shot 让 subagent session（task() 派生）抢先触发一次后，主 agent 永久收不到，与「未写入就一直提醒」
+  设计意图冲突。单测 70/70 全绿（测试名更新为「v2.5 persistent」语义）、bun smoke 5/5
 OCM HTTP API 未就绪（stub 已留，不影响简单经验链路）。

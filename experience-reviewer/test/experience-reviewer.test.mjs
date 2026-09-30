@@ -335,7 +335,7 @@ test('ensureOverviewReminder: 有概述标记 → 记 hasOverview, 不注入', (
   assert.equal(cursor.hasOverview, true, '应记录 hasOverview=true')
 })
 
-test('ensureOverviewReminder: 缺概述标记 → 注入一次 + overviewPrompted, 不重复', () => {
+test('ensureOverviewReminder: 缺概述标记 → 每次 user-turn 都注入 (v2.5 persistent, 不再写 overviewPrompted)', () => {
   const { deps, files } = makeDeps()
   files.set(PROJ_MD, '# 项目规则\n- 规则1\n') // 无 > **项目概述**: 标记
   const r = createExperienceReviewer(deps)
@@ -346,12 +346,17 @@ test('ensureOverviewReminder: 缺概述标记 → 注入一次 + overviewPrompte
     lastUser.parts.some((p) => p.synthetic === true && p.text.includes('项目概述')),
     '缺概述应注入 synthetic 提醒 part'
   )
+  // v2.5: 不再写 cursor.overviewPrompted 字段 (废弃)
   const cursor = r.readCursor(join('C:/proj', '.experience-reviewer', 'experience-cursor.json'))
-  assert.equal(cursor.overviewPrompted, true, '应记录 overviewPrompted=true')
-  // 再次调用 → 不重复注入 (防每轮刷屏)
+  assert.notEqual(cursor?.overviewPrompted, true, 'v2.5 不再写 overviewPrompted')
+  // v2.5: 再次调用 → 仍注入 (persistent 语义, 未写入就一直提醒)
   const messages2 = msgs(1)
   r.ensureOverviewReminder({ messages: messages2 })
-  assert.equal(messages2[0].parts.length, 1, '已提醒过不重复注入')
+  const lastUser2 = messages2[messages2.length - 1]
+  assert.ok(
+    lastUser2.parts.some((p) => p.synthetic === true && p.text.includes('项目概述')),
+    '缺概述未补写 → 第二次仍注入 (v2.5 persistent, 「直到写入为止」)'
+  )
 })
 
 test('ensureOverviewReminder: 最后一条非 user (assistant 生成/工具循环) → 不注入', () => {
