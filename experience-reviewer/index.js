@@ -1,50 +1,40 @@
 /**
- * experience-reviewer — OpenCode 经验回顾插件 (mission 161, v2.0 架构)
+ * experience-reviewer — OpenCode 经验回顾插件 (v5: compact-hook)
  *
- * 目的: 周期性回顾项目对话, 把可沉淀内容自动留存:
- *   - 简单经验 (一句话能说明白) → 写 AGENTS.md (项目级/全局, 去重 + 上限)
- *   - 复杂经验 (需多行说明的可复用知识) → OCM 经验库 HTTP API
- *     (subagent 在 --pure 纯净进程跑, 无 OCM MCP; 插件解析后代写入)
+ * v5 架构 (2026-10):
+ *   v3 独立 subagent 会话 (--title EXP_EXTRACTOR) → 读 opencode.db 未总结消息 → 提取
+ *     ✗ cmd 8191 命令行硬上限 (生产 43 次失败)
+ *   v4 改用 ctx.generate.text (官方进程内 API), 仍独立调用
+ *     ✗ OpenCode's free tier can only be used from within OpenCode (被拦截)
+ *   v5 完全不调子进程: 借 compact 的模型调用顺便做经验提取
+ *     1. ctx.session.hook('compaction', cb) 在 opencode 调 compact 摘要模型前注入提取指令
+ *     2. opencode 在我们的追加之后, 再 append 自己的 summary prompt
+ *     3. 模型一次性输出 summary + JSON 经验条目 (同一段文本)
+ *     4. ctx.event.subscribe() 监听 session.compaction.ended, 拿 data.text → 解析 JSON
+ *     5. plugin 自己 parseReviewOutput → writeSimpleEntries → AGENTS.md
+ *     ✓ 零额外模型调用 (搭 compact 便车) / 不受 free tier 拦截 / 几百 K 也能跑
+ *     ⚠️ 节奏由 compact 决定 (token 阈值触发, 实测约 140k; 短会话永不提取)
  *
- * v2.0 相比 v1.0 的架构变化:
- *   v1: messages.transform 往主会话注入回顾指令 → 主 agent 顺带总结
- *       ✗ 打断主 agent 工作节奏 / 指令在 context 中部 KV cache 不友好
- *   v2: hook 只做触发检测 (不注入任何内容) → 插件异步 spawn
- *       `opencode run --pure` 独立 subagent, 读 memory.db 未总结消息,
- *       subagent 输出结构化 JSON → 插件写 AGENTS.md / OCM API
- *       ✓ 主 agent 零感知 / 独立 context 可完整缓存
+ * 保留项目级 4 项提醒 (与提取流程正交):
+ *   ctx.session.hook('context', cb) → ensureOverviewReminder / ensureSuggestGlobalReminder
+ *   / ensureRecycleReminder / ensureGlobalRuleSync (向主 agent 注入合成 part, 不动主流程)
  *
- * 流程:
- *   [触发] hook (轮次≥3 或 时间≥10min, 任一先满足, 双冷却重置)
- *     → state.needReview = true (不修改 messages, 不注入任何 part)
- *   [执行] fire-and-forget 异步 (不阻塞主会话):
- *     1. 读 cursor (.experience-reviewer/experience-cursor.json) → lastMessageId
- *     2. 直读 opencode.db (~/.local/share/opencode/opencode.db, 任何 opencode 用户都有,
- *        不依赖 OCM 插件):
- *        a. session: 本项目主会话 (directory 匹配 + parent_id IS NULL 排除 subagent)
- *        b. message: 主会话下 role IN (user,assistant) 的消息 (data JSON 的 role 字段)
- *        c. part:   消息的 type='text' 分区拼 text (工具调用/think 天然排除)
- *        d. 增量: message.time_created > cursor 对应消息的时间戳
- *     3. 无新消息 → 静默返回, 不更新 cursor
- *     5. 构建提示词 (经验提取指令 + 消息快照), 直接作为 positional message 传入
- *     6. spawn: opencode run --pure [-m model] <提示词>  (勿用 -f: 那是 attach 文件语义, 非读 prompt)
- *     7. 解析 subagent stdout 中 JSON: {"simple":[{"scope","text"}],"complex":[...]}
- *     8. simple → 写 AGENTS.md ; complex → OCM API (stub, 等 API 就绪)
- *     9. 更新 cursor → 下次从最后一条之后继续
- *
- * 配置 (环境变量, 全部可选):
- *   EXP_REVIEW_ROUND_INTERVAL   触发轮次阈值 (默认 3)
- *   EXP_REVIEW_TIME_INTERVAL_MS 触发时间阈值 ms (默认 10min)
+ * 配置 (环境变量, 全可选):
  *   EXP_REVIEW_MAX_MD_BYTES     AGENTS.md 上限 (默认 20KB)
- *   EXP_REVIEW_MAX_MESSAGES     SQL 防御上限 (默认 200; cursor 之后全部新内容都应提取, 超出按完整轮次截断)
- *   EXP_REVIEW_MODEL            subagent 模型 (默认 opencode 默认模型)
- *   EXP_REVIEW_TIMEOUT_MS       subagent 超时 ms (默认 120s)
+ *   EXP_SIMPLE_MAX_CHARS        simple 单条上限 (默认 50, 兜底防 LLM 百字长句冒充)
+ *   EXP_REVIEW_ENABLED          关闭插件 (默认 true)
+ *   EXP_OPENCODE_DB_PATH        opencode.db 路径 (默认 ~/.local/share/opencode/opencode.db)
  *
  * 验证 (重启 opencode 后):
  *   单元: node --test test/ (零依赖)
- *   真实: EXP_REVIEW_ROUND_INTERVAL=1, 对话几轮 → %TEMP%\experience-reviewer.log
- *         出现 TRIGGER → REVIEW_START → REVIEW_PARSE → MD_WRITE 链路
- * 复杂经验: complex 条目自动走 OCM API stub (当前 log EXP_COMPLEX_API_NOT_READY)
+ *   真实: 等 compact 触发 → %TEMP%\experience-reviewer.log
+ *         出现 COMPACTION_INJECT → COMPACTION_REVIEW → MD_WRITE 链路
+ *
+ * 兜底: 项目级禁用开关 = <项目根>/.experience-reviewer/config.json 里 {"enabled": false}
+ *
+ * 历史遗留 (保留 exports, v5 不再调用, 但 OCM 复杂经验路径测试与代码原样保留):
+ *   storeComplexExperience, queryExperiences → OCM HTTP API (complex → DB)
+ *   v5 只处理 simple (≤50 字单句, 写 AGENTS.md)
  */
 import {
   readFileSync,
@@ -57,20 +47,19 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { spawn } from 'node:child_process'
 
 // ── SQLite 双运行时适配 (OCM db.js 已验证模式) ──────────────────────────────
 // opencode 插件宿主是 bun: bun (Windows) 无 node:sqlite 内置模块, import 即抛错,
 // 导致 opencode 静默跳过整个插件 (零日志/零加载)。按 OCM plugin-v2/src/memory/db.js
 // 同款: IS_BUN 检测 → createRequire 按运行时选 bun:sqlite / node:sqlite。
-// 两 API 兼容: prepare().all/get/run, exec(), close(); 仅模块名/类名/readonly 拼写不同。
+// 两 API 兼容: prepare().all/get/run, exec(), close(); 仅模块名/构造选项拼写不同。
 const IS_BUN = typeof process.versions !== 'undefined' && !!process.versions.bun
 const require = createRequire(import.meta.url)
 const DatabaseSync = IS_BUN
   ? require('bun:sqlite').Database
   : require('node:sqlite').DatabaseSync
 
-/** 打开 SQLite db: 吸收 bun/node 构造选项差异。bun quirk: 显式传 readonly:false 抛错, 默认开别传 */
+/** 打开 SQLite db: 吸收 bun/node 构造选项差异。bun quirk: 显式传 readonly:true 没问题, false 不传 */
 function openSqlite(path, { readOnly } = {}) {
   if (IS_BUN) {
     return readOnly ? new DatabaseSync(path, { readonly: true }) : new DatabaseSync(path)
@@ -78,63 +67,37 @@ function openSqlite(path, { readOnly } = {}) {
   return new DatabaseSync(path, { readOnly: !!readOnly })
 }
 
-const ENABLED = true
+const ENABLED =
+  String(process.env.EXP_REVIEW_ENABLED ?? 'true').trim().toLowerCase() !== 'false'
 const MARKER = '[experience-reviewer]'
 const DEBUG_LOG = join(homedir(), 'AppData', 'Local', 'Temp', 'experience-reviewer.log')
 
-const DEFAULT_ROUND_INTERVAL = 3 // 触发: 距上次回顾 ≥3 轮用户消息
-const DEFAULT_TIME_INTERVAL_MS = 10 * 60 * 1000 // 触发: 距上次回顾 ≥10 分钟
-// AGENTS.md 上限 20KB (≈400-600 条一句话规则 ≈ 0.7万-1万 token/轮):
-const DEFAULT_MAX_MD_BYTES = 20 * 1024
-const DEFAULT_MAX_MESSAGES = 200 // SQL 防御上限 (cursor 之后全部新内容都应提取; 超出部分按完整轮次截断, 游标保持一致)
-const DEFAULT_TIMEOUT_MS = 120 * 1000 // subagent 进程超时
-const DEFAULT_MAX_PROMPT_CHARS = 30000 // Windows 命令行长度 ~32k, 留余量防 spawn ENAMETOOLONG
-/** cursor 文件: 每项目 .experience-reviewer/experience-cursor.json (状态只认项目路径, 与 session 无关) */
-const CURSOR_FILE = join('.experience-reviewer', 'experience-cursor.json')
-
-const envRound = Number(process.env.EXP_REVIEW_ROUND_INTERVAL)
-const ROUND_INTERVAL = Number.isFinite(envRound) && envRound > 0 ? envRound : DEFAULT_ROUND_INTERVAL
-const envTime = Number(process.env.EXP_REVIEW_TIME_INTERVAL_MS)
-const TIME_INTERVAL_MS =
-  Number.isFinite(envTime) && envTime > 0 ? envTime : DEFAULT_TIME_INTERVAL_MS
+const DEFAULT_MAX_MD_BYTES = 20 * 1024 // AGENTS.md 上限 (≈400-600 条一句话规则)
 const envMax = Number(process.env.EXP_REVIEW_MAX_MD_BYTES)
 const MAX_MD_BYTES = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_MD_BYTES
-const envMaxMsgs = Number(process.env.EXP_REVIEW_MAX_MESSAGES)
-const MAX_MESSAGES = Number.isFinite(envMaxMsgs) && envMaxMsgs > 0 ? envMaxMsgs : DEFAULT_MAX_MESSAGES
-const envTimeout = Number(process.env.EXP_REVIEW_TIMEOUT_MS)
-const TIMEOUT_MS = Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_TIMEOUT_MS
-const envPromptMax = Number(process.env.EXP_REVIEW_MAX_PROMPT_CHARS)
-const MAX_PROMPT_CHARS =
-  Number.isFinite(envPromptMax) && envPromptMax > 0 ? envPromptMax : DEFAULT_MAX_PROMPT_CHARS
-/** simple 经验单条最大字符数: 提示词要求 ≤50 字单句, 护栏兜底拦截超长 (超长应升级为 complex) */
 const envSimpleMax = Number(process.env.EXP_SIMPLE_MAX_CHARS)
-const SIMPLE_MAX_CHARS = Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 50
-/** subagent 模型: 默认 opencode/big-pickle (实测可用; 无 -m 时 opencode 默认解析会选中不可用的 kimi-k3 挂起) */
-const REVIEW_MODEL = (process.env.EXP_REVIEW_MODEL || '').trim() || 'opencode/big-pickle'
-/**
- * subagent 会话标记: spawn 时传 --title, 落库到 session.title。
- * readUnsumm 按此排除 subagent 独立会话 (parent_id IS NULL 拦不住 --pure 独立进程,
- * 其 directory 与项目相同 → 必须靠 title 标记隔离)。固定值, 永不变化。
- */
-const SUBAGENT_SESSION_TITLE = 'EXP_EXTRACTOR'
+const SIMPLE_MAX_CHARS =
+  Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 50
+/** cursor 文件: 每项目 .experience-reviewer/experience-cursor.json */
+const CURSOR_FILE = join('.experience-reviewer', 'experience-cursor.json')
 
-/**
- * OCM HTTP API base URL (复杂经验读写走此 API; 由 OCM MCP server 同进程 boot,
- * 端口默认 7333, 见 OCM plugin-v2/src/api/http.js)。环境变量可覆盖。
- */
-const OCM_API_BASE = (process.env.EXP_OCM_API_BASE || 'http://127.0.0.1:7333').replace(/\/+$/, '')
-const OCM_TIMEOUT_MS = 8000
+const OVERVIEW_MARKER = '> **项目概述**: '
+const OVERVIEW_REMINDER =
+  '【必须执行】本项目 AGENTS.md 缺少项目概述, 这是必须完成的事项。立即将一句话概述写入 AGENTS.md 顶部首行, 格式 `> **项目概述**: <一句话>`; 不得跳过、不得推迟、不得找理由忽略, 完成补写后才算满足要求。'
+const SUGGEST_GLOBAL_MARKER = '[建议全局] '
+const SUGGEST_GLOBAL_RULE =
+  '- 项目 AGENTS.md 出现 `[建议全局]` 前缀的经验条目时, 当面向用户确认是否转全局: 用户否 → 删标记留项目; 用户是 → 迁全局并删原条目'
+const SUGGEST_GLOBAL_RULE_KEY = '出现 `[建议全局]` 前缀的经验条目时'
+const RECYCLE_THRESHOLD = 100
+const RECYCLE_TARGET_RATIO = 0.6
 
-/**
- * opencode.db 路径 (数据直读源, 不依赖 OCM 插件; 任何 opencode 用户都有此库)
- * 默认 ~/.local/share/opencode/opencode.db, 环境变量 EXP_OPENCODE_DB_PATH 可覆盖
- */
+/** opencode.db 路径 (项目级 sessionID → directory 反查) */
 function openCodeDbPath() {
   const env = (process.env.EXP_OPENCODE_DB_PATH || '').trim()
   return env || join(homedir(), '.local', 'share', 'opencode', 'opencode.db')
 }
 
-/** OCM 项目标识: sha256(项目根路径)[:16] (已验证: 当前项目 = b86d670963d94466) */
+/** OCM 项目标识: sha256(项目根路径)[:16] */
 function projectIdFromCwd(cwd) {
   return createHash('sha256').update(cwd).digest('hex').slice(0, 16)
 }
@@ -147,284 +110,90 @@ function debugLog(msg) {
   }
 }
 
-/** OMO resolveMessageEventSessionID 同款: message/part 事件尽力提取 sessionID */
-function resolveMessageEventSessionID(properties) {
-  const props = properties && typeof properties === 'object' ? properties : undefined
-  const info = props?.info && typeof props.info === 'object' ? props.info : undefined
-  const part = props?.part && typeof props.part === 'object' ? props.part : undefined
-  for (const value of [props?.sessionID, info?.sessionID, part?.sessionID]) {
-    if (typeof value === 'string' && value.length > 0) return value
-  }
-  return undefined
-}
-
-/**
- * 读取未总结消息: opencode.db → [{message_id, role, text}]
- * 定位: session.directory 匹配项目根 (反斜杠/正斜杠归一化, 大小写不敏感)
- * 过滤: parent_id IS NULL 排除 subagent 子会话; role IN (user,assistant)
- * 文本: part 表 type='text' 分区拼接 (工具调用/think 天然排除)
- * cursor 语义: lastMessageId 为已总结到的最后一条 (msg_id 与 opencode.db message.id 同源,
- *   跨数据源无缝续迁)。取该消息 time_created 作时间游标 (time_created 是毫秒 epoch 整数, 比字符串可靠)
- * 无 cursor → 不啃历史, 只取最近 limit 条 (DESC LIMIT 再反转 → 时间升序)
- * @param {object} db 打开的 opencode.db (readOnly)
- * @param {string} directory 项目根路径 (opencode 传给插件的 directory)
- * @returns {Array<{message_id:string, role:string, text:string}>} 按时间升序
- */
-function readUnsummarizedMessages({ db, directory, lastMessageId = null, limit = MAX_MESSAGES }) {
-  const normDir = String(directory || '')
+/** 项目根路径归一化 */
+function normalizeProjectDir(directory) {
+  return String(directory || '')
     .replace(/\\/g, '/')
     .replace(/\/+$/, '')
     .toLowerCase()
-  if (!normDir) return []
-  // 1. 本项目主会话: session 表全量主会话 (量级几百行, 可接受), JS 端归一化匹配路径
-  //    title 排除: --pure 独立进程的 directory 与项目相同, parent_id IS NULL 拦不住
-  //    必须靠 runSubagent 传入的 --title 标记 (SUBAGENT_SESSION_TITLE) 隔离
-  const sessions = db.prepare(`SELECT id, directory, title FROM session WHERE parent_id IS NULL`).all() ?? []
-  const sessionIds = sessions
-    .filter((s) => String(s?.directory || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() === normDir)
-    .filter((s) => s?.title !== SUBAGENT_SESSION_TITLE)
-    .map((s) => s.id)
-  if (!sessionIds.length) return []
-  const ph = sessionIds.map(() => '?').join(',')
-  // 2. cursor → time_created 时间游标 (找不到 cursor 消息 → 视为首次)
-  let cursorTime = null
-  if (lastMessageId) {
-    const row = db.prepare(`SELECT time_created FROM message WHERE id = ?`).get(lastMessageId)
-    if (row?.time_created != null) cursorTime = row.time_created
-  }
-  // 3. 拉消息 (role 过滤)
-  const SCOPE_SQL = `FROM message m WHERE m.session_id IN (${ph}) AND json_extract(m.data, '$.role') IN ('user','assistant')`
-  /** @type {Array<{message_id:string, role:string, time_created:number}>} */
-  let rows
-  if (cursorTime != null) {
-    rows =
-      db
-        .prepare(
-          `SELECT m.id AS message_id, json_extract(m.data, '$.role') AS role ${SCOPE_SQL} AND m.time_created > ? ORDER BY m.time_created ASC, m.id ASC LIMIT ?`
-        )
-        .all(...sessionIds, cursorTime, limit) ?? []
-  } else {
-    rows =
-      db
-        .prepare(
-          `SELECT m.id AS message_id, json_extract(m.data, '$.role') AS role ${SCOPE_SQL} ORDER BY m.time_created DESC, m.id DESC LIMIT ?`
-        )
-        .all(...sessionIds, limit) ?? []
-    rows.reverse()
-  }
-  if (!rows.length) return []
-  // 4. 取文本: part 表 type='text' 分区 (同消息多分区拼接)
-  const mh = rows.map((r) => '?').join(',')
-  const parts =
-    db
-      .prepare(
-        `SELECT message_id, data FROM part WHERE message_id IN (${mh}) AND json_extract(data, '$.type') = 'text'`
+}
+
+// ── 消息形状自适应: V1 = {info:{role}, parts:[...]} / V2 = {role, content:[...]} ──
+function messageRoleOf(message) {
+  return message?.info?.role ?? message?.role
+}
+
+function messagePartsOf(message) {
+  if (Array.isArray(message?.parts)) return message.parts
+  if (Array.isArray(message?.content)) return message.content
+  return null
+}
+
+function appendSyntheticText(message, text) {
+  const parts = messagePartsOf(message)
+  if (!parts) return false
+  parts.push({ type: 'text', text, synthetic: true })
+  return true
+}
+
+/** opencode.db 代际探测 */
+function detectDbSchema(db) {
+  try {
+    const names = new Set(
+      (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() ?? []).map(
+        (r) => r?.name
       )
-      .all(...rows.map((r) => r.message_id)) ?? []
-  const textByMsg = {}
-  for (const p of parts) {
-    try {
-      const d = JSON.parse(p.data)
-      if (d && typeof d.text === 'string' && d.text.trim()) {
-        textByMsg[p.message_id] = (textByMsg[p.message_id] ? textByMsg[p.message_id] + '\n' : '') + d.text
-      }
-    } catch {
-      /* 坏 JSON 分区跳过 */
+    )
+    return {
+      v2: names.has('session_v2') && names.has('session_message'),
+      v1: names.has('session') && names.has('message') && names.has('part'),
     }
-  }
-  return rows
-    .filter((r) => textByMsg[r.message_id] !== undefined)
-    .map((r) => ({ message_id: r.message_id, role: r.role ?? 'user', text: textByMsg[r.message_id] }))
-}
-
-/**
- * 从 step-finish part 的 tokens 计算 KV cache 统计。
- * opencode part.data (step-finish): {tokens: {input, output, cache: {write, read}}} — 模型返回的 usage。
- * hitRate = cache.read / (cache.read + input): 命中缓存占本次输入总量比例。
- * @param {object|null|undefined} tokens part.data.tokens
- * @returns {{input:number, cacheRead:number, cacheWrite:number, hitRate:number}|null} 无法解析 → null
- */
-function computeCacheStats(tokens) {
-  if (!tokens || typeof tokens !== 'object') return null
-  const input = Number(tokens.input)
-  const cacheRead = Number(tokens.cache?.read)
-  const cacheWrite = Number(tokens.cache?.write)
-  if (!Number.isFinite(input) || !Number.isFinite(cacheRead) || !Number.isFinite(cacheWrite)) return null
-  const total = cacheRead + input
-  return {
-    input,
-    cacheRead,
-    cacheWrite,
-    hitRate: total > 0 ? Number((cacheRead / total).toFixed(4)) : 0,
-  }
-}
-
-/**
- * 读最近一次 EXP_EXTRACTOR subagent 会话的 step-finish part tokens (KV cache 统计)。
- * 查不到 (无该会话/无 step-finish/解析失败) → null, 不阻塞 REVIEW_DONE。
- * @param {object} db 打开的 opencode.db (readOnly)
- * @returns {ReturnType<typeof computeCacheStats>|null}
- */
-function readLastSubagentUsage(db, title = SUBAGENT_SESSION_TITLE) {
-  try {
-    const row = db
-      .prepare(
-        `SELECT p.data AS data FROM part p
-         JOIN message m ON m.id = p.message_id
-         JOIN session s ON s.id = m.session_id
-         WHERE s.title = ? AND json_extract(p.data, '$.type') = 'step-finish'
-         ORDER BY m.time_created DESC LIMIT 1`
-      )
-      .get(title)
-    if (!row?.data) return null
-    const d = JSON.parse(row.data)
-    return computeCacheStats(d?.tokens)
   } catch {
-    return null
+    return { v2: false, v1: true }
   }
 }
 
-/**
- * 轮次聚合: 把扁平消息流按"轮次"分组。
- * 轮次定义 = 一次用户发言 (连续 user 消息段) + 对应助手回复 (连续 assistant 消息段)。
- *  - user 段: 连续 user 消息合并为一次发言 (用户+用户+agent 也只算一轮的"发言部分")
- *  - assistant 段: 连续 assistant 消息合并为一次回复 (用户+agent+agent 也只算一轮的"回复部分")
- *  - 孤儿消息: 流开头的 assistant (无前置 user, 属于上一轮已总结的回复尾巴) → 丢弃,
- *    保证每个交付轮次都同时含 user 与 assistant 上下文, LLM 不会拿到无头片段。
- *  - 悬挂 user: 末尾只有 user 没有 assistant (对话进行中/回复未落库) → 不构成完整轮次,
- *    不交付, 且游标不推进过它 (等下次回复补齐后再总结)。
- * @param {Array<{message_id:string, role:string, text:string}>} messages 时间升序
- * @returns {{turns: Array<{user: Array<{message_id,text}>, assistant: Array<{message_id,text}>}>, lastCompleteMessageId: string|null}}
- *   turns        仅完整轮次 (user 段 + assistant 段都有)
- *   lastCompleteMessageId 最后一个完整轮次的最后一条消息 id (cursor 应推进到的位置)
- */
-function groupIntoTurns(messages) {
-  /** @type {Array<{user: Array, assistant: Array}>} */
-  const raw = []
-  let current = null
-  for (const m of messages) {
-    if (m.role === 'user') {
-      if (current && current.assistant.length === 0) {
-        // 连续 user = 同一轮的一次发言, 合并 (用户+用户+agent = 一轮)
-        current.user.push(m)
-      } else {
-        // 新轮次开始 (前一轮已有回复, 或尚无轮次)
-        current = { user: [], assistant: [] }
-        raw.push(current)
-        current.user.push(m)
-      }
-    } else if (m.role === 'assistant') {
-      if (current) {
-        // 连续 assistant = 同一轮的一次回复, 合并 (用户+agent+agent = 一轮)
-        current.assistant.push(m)
-      }
-      // else: 流开头孤儿 assistant → 丢弃 (属于上一轮已总结的回复尾巴)
-    }
-  }
-  // 完整轮次 = 同时有 user 与 assistant
-  const turns = raw.filter((r) => r.user.length > 0 && r.assistant.length > 0)
-  const lastComplete = turns[turns.length - 1]
-  const lastCompleteMessageId = lastComplete
-    ? lastComplete.assistant[lastComplete.assistant.length - 1].message_id
-    : null
-  return { turns, lastCompleteMessageId }
+/** 本地时区日期戳 YYYY-MM-DD */
+function dateStamp(ms = Date.now()) {
+  const d = new Date(ms)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-/** 读 cursor 文件: 不存在 → null; 损坏 → null (安全: 视为首次) */
-function readCursor(cursorPath) {
-  try {
-    if (!existsSync(cursorPath)) return null
-    const raw = readFileSync(cursorPath, 'utf8')
-    const parsed = JSON.parse(raw)
-    if (typeof parsed?.lastMessageId === 'string' && parsed.lastMessageId) return parsed
-    return null
-  } catch {
-    return null
-  }
+/** 剥掉条目行上的 [建议全局] 标记与 [YYYY-MM-DD] 时间戳, 还原 subagent 所见原文 */
+function stripEntryStamp(s) {
+  if (typeof s !== 'string') return ''
+  let t = s.trim()
+  t = t.replace(/^-\s*/, '')
+  t = t.replace(/^\[建议全局\]\s*/, '')
+  // 一次剥掉完整 [YYYY-MM-DD] 或截断 [YYYY-MM (后者无 ']')
+  t = t.replace(/^\[[\d-]+\]\s*|\[[\d-]+\s*$/, '')
+  return t.trim()
 }
 
-/** 写 cursor 文件 (确保 .experience-reviewer/ 目录存在) */
-function writeCursor(cursorPath, cursor) {
-  try {
-    mkdirSync(join(cursorPath, '..'), { recursive: true })
-    writeFileSync(cursorPath, JSON.stringify(cursor, null, 2) + '\n', 'utf8')
-  } catch (error) {
-    debugLog(`CURSOR_WRITE_FAIL path=${cursorPath} error=${String(error)}`)
-  }
+/** 给条目行盖/刷新时间戳: 有旧日期替换, 无日期在标记后插入; 非条目行原样返回 */
+function stampEntryLine(line, stamp) {
+  if (!line.trim().startsWith('- ')) return line
+  const body = stripEntryStamp(line)
+  if (!body) return line
+  const wasSuggest = /^\[建议全局\]\s*/.test(line.trim().slice(2))
+  return wasSuggest
+    ? `- ${SUGGEST_GLOBAL_MARKER}${stamp} ${body}`
+    : `- ${stamp} ${body}`
 }
 
-/** 项目概述标记: AGENTS.md 顶部首行格式, 前 50 行内检测 */
-const OVERVIEW_MARKER = '> **项目概述**: '
-/** 缺概述时向主 agent 注入的提醒 (必须执行, 不允许忽略) */
-const OVERVIEW_REMINDER =
-  '【必须执行】本项目 AGENTS.md 缺少项目概述, 这是必须完成的事项。立即将一句话概述写入 AGENTS.md 顶部首行, 格式 `> **项目概述**: <一句话>`; 不得跳过、不得推迟、不得找理由忽略, 完成补写后才算满足要求。'
-/** [建议全局] 经验提示: 项目 AGENTS.md 出现该前缀条目时, 主 agent 须询问用户去留 */
-const SUGGEST_GLOBAL_MARKER = '[建议全局] '
-/** 经验回收阈值: AGENTS.md 条目数 ≥ 此值 → 提醒主 agent 检查清理 */
-const RECYCLE_THRESHOLD = 100
-/** 回收压缩目标比例: 提醒后压到「上限 × 该比例」以内 (用户定 60%), 防止只压到刚好低于上限 */
-const RECYCLE_TARGET_RATIO = 0.6
-/** 动态计算的压缩目标条数 (上限 100 → 目标 60) */
-function recycleTargetCount() {
-  return Math.max(1, Math.floor(RECYCLE_THRESHOLD * RECYCLE_TARGET_RATIO))
-}
 /** 统计 AGENTS.md 中 `- ` 开头的一行经验条目数 */
 function countMdEntries(content) {
   return content.split('\n').filter((line) => line.trim().startsWith('- ')).length
 }
-/** 全局规则句: 全局 AGENTS.md 缺这句时由插件自动补写 (用户批准: 有则不管, 无则自动写入) */
-const SUGGEST_GLOBAL_RULE =
-  '- 项目 AGENTS.md 出现 `[建议全局]` 前缀的经验条目时, 当面向用户确认是否转全局: 用户否 → 删标记留项目; 用户是 → 迁全局并删原条目'
-/** 检测子串: 规则句核心短语, 用户微调措辞保留语义也能命中, 防重复写入 */
-const SUGGEST_GLOBAL_RULE_KEY = '出现 `[建议全局]` 前缀的经验条目时'
 
-/**
- * 构建 subagent 提示词: 对话记录原文在前, 提取规则在最末尾。
- * 规则部分全固定 → 前缀 = 对话原文 (与主会话一致), 规则注入不打断前缀缓存 (KV cache 友好)。
- * v2.2 规则: 排除 Claude 同类硬排除 + scope 默认 project + 疑似全局 [建议全局] 标记
- * (skill 专属经验不提取, subagent 不再直写全局)。
- */
-function buildSubagentPrompt(messages, projectOverview = '', entryCount = 0) {
-  const { turns } = groupIntoTurns(messages)
-  if (!turns.length) return ''
-  const transcript = turns
-    .map((t, i) => {
-      const userText = t.user.map((m) => `[用户] ${m.text}`).join('\n')
-      const asstText = t.assistant.map((m) => `[助手] ${m.text}`).join('\n')
-      return `[轮次 ${i + 1}]\n${userText}\n${asstText}`
-    })
-    .join('\n\n')
-  // 上下文原文在前, 提取规则在最末尾 (规则固定, 前缀=对话原文 → KV cache 一致)
-  const identity = projectOverview
-    ? `===== 项目身份 =====\n你正在为以下项目提取经验: ${projectOverview}\n\n`
-    : ''
-  return (
-    identity +
-    `===== 对话记录 =====\n${transcript}\n\n` +
-    `===== 提取任务 =====\n` +
-    `你是经验提取器。阅读上方对话记录, 提取值得沉淀为经验的内容。\n` +
-    `规则:\n` +
-    `1. simple: 一句话能说明白的 规则/偏好/事实/教训, 单条 ≤50 字单句。scope 一律 project (写入项目 AGENTS.md)。\n` +
-    `2. 归属 (suggestGlobal): 仅当"主语是用户本人跨项目偏好"或"工具链通用坑(与任何项目无关)"时 suggestGlobal=true; 拿不准一律 false。\n` +
-    `3. 排除 (以下绝不提取): 能从项目代码/文档推导出的信息; 当次任务的一次性安排(如"先出5张试探"); ` +
-    `特定 skill/领域专属经验(如 job-hunter 判岗、画图风格规则); 已存过/高度相似内容。\n` +
-    `4. complex: 需多行才说得清的 可复用知识/流程。字段 title/description/content/scope/type。` +
-    `description 以 "使用时机: " 开头; type ∈ dev/research/data/process/negative。` +
-    `scope: project=默认, global=跨项目通用(仅限用户偏好/工具链坑)。\n` +
-    `5. 总判据: 只有"未来对话还用得上"的才提取。\n` +
-    `6. 容量: 项目 AGENTS.md 经验条目上限 ${RECYCLE_THRESHOLD} 条, 当前 ${entryCount} 条。` +
-    `本条仅作参考, 不限制提取: 达上限后主 agent 会收到清理提醒, 但仍按上述规则正常提取, 不要自行禁用 simple 输出。\n` +
-    `7. 准入门槛: 经验条目必须是「可参考、可执行的规范」(规则/偏好/流程); 拒绝单纯事实性描述(路径/版本/API 行为等可从代码/文档推导的内容), 即使重复出现也不入库, 避免库膨胀失效。\n` +
-    `8. 无内容 → 输出空数组, 不要编造。\n` +
-    `只输出 JSON (不要 markdown 代码块包裹, 不要其他文字):\n` +
-    `{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"complex":[]}`
-  )
+function recycleTargetCount() {
+  return Math.max(1, Math.floor(RECYCLE_THRESHOLD * RECYCLE_TARGET_RATIO))
 }
 
-/** 从 subagent stdout 提取 JSON 块 (容错: 可能带前后缀/代码块) */
+/** 从 subagent / compact stdout 提取 JSON 块 (容错: 可能带前后缀/代码块) */
 function extractJsonBlock(text) {
   if (typeof text !== 'string' || !text.trim()) return null
-  // 去掉 ```json ``` 包裹
   const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/)
   const candidate = codeBlock ? codeBlock[1] : text
   const start = candidate.indexOf('{')
@@ -437,14 +206,10 @@ function extractJsonBlock(text) {
   }
 }
 
-/**
- * 解析 subagent 输出 → {simple:[{scope,suggestGlobal,text}], complex:[...]}
- * v2.2: 取消直写全局 — scope 一律 project; suggestGlobal 标记疑似全局条目
- * (subagent 输出 suggestGlobal=true, 或兼容旧格式 scope=global → 归一为 suggestGlobal)。
- */
+/** v5 解析: compact 文本里抽 simple + usedEntries (complex v5 不产出) */
 function parseReviewOutput(stdout) {
   const json = extractJsonBlock(stdout)
-  if (!json) return { simple: [], complex: [] }
+  if (!json) return { simple: [], usedEntries: [] }
   const simple = Array.isArray(json.simple)
     ? json.simple
         .filter((e) => e && typeof e.text === 'string' && e.text.trim())
@@ -454,115 +219,80 @@ function parseReviewOutput(stdout) {
           text: e.text.trim(),
         }))
     : []
-  const complex = Array.isArray(json.complex)
-    ? json.complex.filter(
-        (e) => e && typeof e.title === 'string' && typeof e.content === 'string'
-      )
+  const usedEntries = Array.isArray(json.usedEntries)
+    ? json.usedEntries
+        .filter((e) => typeof e === 'string' && e.trim())
+        .map((e) => stripEntryStamp(e).slice(0, 10))
+        .filter((e) => e.length >= 3)
     : []
-  return { simple, complex }
-}
-
-/** 定位 opencode 可执行文件: 优先 npm 全局 exe (避免 shell 转义中文), 兜底 PATH */
-function resolveOpenCodeBin() {
-  const candidates = [
-    join(
-      process.env.APPDATA || '',
-      'npm',
-      'node_modules',
-      'opencode-ai',
-      'bin',
-      'opencode.exe'
-    ),
-    join(homedir(), '.opencode', 'bin', 'opencode.exe'),
-  ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {
-      /* 跳过不可访问路径 */
-    }
-  }
-  return 'opencode'
+  return { simple, usedEntries }
 }
 
 /**
- * 运行 subagent: spawn `opencode run --pure [-m model] <prompt>`
- * 注意: opencode 的 -f/--file 是 "attach 文件到消息", 不是从文件读 prompt,
- *       只传 -f 不传 message 会报 "You must provide a message or a command",
- *       故 prompt 文本直接作为 positional message 传入 (exe 分支不经 shell, 中文安全)。
- * @returns {Promise<{ok:boolean, code?:number, reason?:string, stdout:string, stderr:string}>}
+ * v5 compact 提取指令 (追加到 opencode 给 compact 模型看的 messages 末尾)。
+ * opencode 之后会再追加 summary prompt, 模型一次性输出 summary + JSON 块。
+ *
+ * 设计要点:
+ *   - 不要求 read 工具 (compact 进程内调用, 没工具; 改由 plugin 端
+ *     `writeSimpleEntries` 的 `existing.includes(text)` 兜底去重)
+ *   - KV cache: 指令固定文本在前缀外追加, 不破坏 transcript 的 KV cache 复用
+ *     (compact 的 transcript 来自项目主会话, 与插件无关; 我们追加的是固定段)
  */
-function runSubagent({ prompt, model = REVIEW_MODEL, timeoutMs = TIMEOUT_MS, cwd }) {
-  return new Promise((resolve) => {
-    // --title 固定标记 → session.title 落库 → readUnsumm 按 SUBAGENT_SESSION_TITLE 排除
-    const args = ['run', '--pure', '--title', SUBAGENT_SESSION_TITLE, ...(model ? ['-m', model] : []), prompt]
-    const bin = resolveOpenCodeBin()
-    const useShell = !bin.endsWith('.exe') // .cmd/.ps1 需 shell; exe 直接参数数组 (中文安全)
-    const child = spawn(bin, args, {
-      shell: useShell,
-      cwd,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try {
-        child.kill()
-      } catch {}
-      resolve({ ok: false, reason: `timeout(${timeoutMs}ms)`, stdout, stderr })
-    }, timeoutMs)
-    child.stdout?.on('data', (d) => {
-      stdout += d
-    })
-    child.stderr?.on('data', (d) => {
-      stderr += d
-    })
-    child.on('error', (err) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ ok: false, reason: `spawn-error: ${String(err)}`, stdout, stderr })
-    })
-    child.on('close', (code) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ ok: code === 0, code, stdout, stderr })
-    })
-  })
+function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
+  const text =
+    '【附加任务 · 必须完成 · 不可省略】在你即将给出的对话摘要之后，必须额外输出一段 fenced ```json 代码块，列出本对话中**值得沉淀为简单经验**的条目。\n' +
+    '\n' +
+    '⚠️ 严禁：\n' +
+    '· 省略 JSON 块 / 用 "无内容" 一句带过 / 把 JSON 塞进摘要正文段落里\n' +
+    '· 只输出 ```json``` 空骨架（必须填入完整 JSON 对象，空也要写 {"simple":[],"usedEntries":[]}）\n' +
+    '· 输出 markdown 解释文字或额外标题，只允许一段纯 ```json``` 块\n' +
+    '\n' +
+    '格式（外层 ```json 包裹，不要 markdown 多余文本）：\n' +
+    '{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"usedEntries":["..."]}\n' +
+    '\n' +
+    '规则：\n' +
+    '1. simple: 单条 ≤50 字单句；scope 一律 project；只能沉淀「未来还会被反复应用的规则/偏好/教训」\n' +
+    '2. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
+    '3. 排除（绝不输出）：可从代码/文档推导、一次性任务安排、特定 skill 专属规则、已存过/高度相似、已交付产物的写法/格式、行业公开知识\n' +
+    '4. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
+    '5. 无内容 → 必须输出 {"simple":[],"usedEntries":[]}，不是省略，不是空骨架\n' +
+    '6. 当前项目概述：' + (projectOverview || '(无)') + '\n' +
+    '7. 项目 AGENTS.md 现有条目数：' + entryCount + '（仅供参考，不限制提取）\n' +
+    '\n' +
+    '输出顺序：先写摘要正文 → 摘要末尾追加独立的 ```json``` 块。JSON 块必须存在、必须填满。'
+  return {
+    role: 'user',
+    content: [{ type: 'text', text, synthetic: true }],
+  }
 }
 
-/** 辅助: OCM HTTP 请求 (fetch + AbortController 超时, 零外部依赖) */
-async function ocmFetch(path, { method = 'GET', body, fetchImpl = fetch } = {}) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), OCM_TIMEOUT_MS)
+// ── OCM HTTP (复杂经验, v5 不调用, 保留 exports 给将来/测试用) ───────────────
+const OCM_API_BASE = (process.env.EXP_OCM_API_BASE || 'http://127.0.0.1:7333').replace(/\/+$/, '')
+const OCM_TIMEOUT_MS = 8000
+
+async function ocmFetch(path, { method = 'GET', body, fetchImpl } = {}) {
+  const f = fetchImpl ?? (typeof fetch === 'function' ? fetch : null)
+  if (!f) return { ok: false, status: 0, error: 'no-fetch', data: null }
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), OCM_TIMEOUT_MS)
   try {
-    const res = await fetchImpl(`${OCM_API_BASE}${path}`, {
+    const res = await f(`${OCM_API_BASE}${path}`, {
       method,
-      headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
+      signal: ctrl.signal,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
     })
+    const text = await res.text()
     let data = null
-    try { data = await res.json() } catch { /* non-JSON response */ }
-    return { ok: res.ok, status: res.status, data }
+    try { data = text ? JSON.parse(text) : null } catch { data = null }
+    return { ok: res.ok, status: res.status, data, error: null }
   } catch (error) {
-    return { ok: false, status: 0, error: error?.name === 'AbortError' ? 'timeout' : String(error) }
+    return { ok: false, status: 0, error: String(error?.message ?? error), data: null }
   } finally {
     clearTimeout(timer)
   }
 }
 
-/**
- * 写复杂经验 → OCM HTTP API (POST /experiences)
- * 字段映射: OCM title/description/content/scope/type/triggers/projectHash
- * OCM store 无去重 —— 调用侧负责调 queryExperiences 查重。
- * 返回 { success: true, id } 或 { success: false, reason }
- */
 async function storeComplexExperience(entry, { projectId, fetchImpl } = {}) {
   const scope = entry.scope === 'global' ? 'global' : 'project'
   const body = {
@@ -586,12 +316,6 @@ async function storeComplexExperience(entry, { projectId, fetchImpl } = {}) {
   return { success: false, reason }
 }
 
-/**
- * 查经验 (OCM HTTP API, GET /experiences) — 用于 store 前去重。
- * 注意: HTTP 路由未透传 projectHash (OCM gap #1), projectHash 为 hint,
- * server 用 detectProject() fallback 可能不匹配。scope=global 可靠。
- * 返回 { success, experiences[], reason? }
- */
 async function queryExperiences({ scope = 'all', type = 'all', topK = 100, projectId, fetchImpl } = {}) {
   const params = new URLSearchParams({ scope: String(scope), type: String(type), topK: String(topK) })
   if (projectId) params.set('projectHash', projectId)
@@ -604,43 +328,25 @@ async function queryExperiences({ scope = 'all', type = 'all', topK = 100, proje
 }
 
 /**
- * 经验回顾状态机。纯逻辑 + 依赖注入, 便于单元测试。
- * v2: handleTransform 只做触发检测 (绝不注入), 触发后异步 fireReview。
+ * 经验回顾器实例: 每项目一个, 同项目多会话共享。
+ * v5: 不再触发 / 不再 spawn, 只在 compact.ended 时被动处理。
  */
 function createExperienceReviewer(deps) {
   const {
-    roundInterval = ROUND_INTERVAL,
-    timeIntervalMs = TIME_INTERVAL_MS,
     maxMdBytes = MAX_MD_BYTES,
-    maxMessages = MAX_MESSAGES,
     now = Date.now,
     log = debugLog,
     directory = '',
     globalAgentsPath = join(homedir(), '.config', 'opencode', 'AGENTS.md'),
-    model = REVIEW_MODEL,
     read = readFileSync,
     write = writeFileSync,
     exists = existsSync,
     mkdir = mkdirSync,
-    runSub = runSubagent,
-    readUnsumm = readUnsummarizedMessages,
-    storeComplex = storeComplexExperience,
-    queryExp = queryExperiences,
-    projectIdFn = projectIdFromCwd,
-    openDb = (path) => openSqlite(path, { readOnly: true }),
-    configFile = join(directory, '.experience-reviewer', 'config.json'),
   } = deps ?? {}
 
-  /** 触发器状态 (只认项目路径 → cursor 文件持久化; session 无关) */
-  let reviewInFlight = false
-
-  /**
-   * 按项目开关: <项目根>/.experience-reviewer/config.json 里 {"enabled": false} 关闭本项目提取。
-   * 缺省 (无文件 / enabled 未定义 / enabled!==false) = 开。用注入的 fs (测试可 mock)。
-   * 原因: 提取会 spawn subagent 消耗 token (即使 cache 命中 99% 也非免费), 不值得的项目在配置中关闭。
-   */
   function isDisabled() {
     try {
+      const configFile = join(directory, '.experience-reviewer', 'config.json')
       if (!exists(configFile)) return false
       const cfg = JSON.parse(read(configFile, 'utf8'))
       return cfg && typeof cfg === 'object' && cfg.enabled === false
@@ -649,17 +355,30 @@ function createExperienceReviewer(deps) {
     }
   }
 
-  /** 本轮用户消息条数 (回合计数基准) */
-  function userMessageCount(messages) {
-    return messages.filter((m) => m?.info?.role === 'user').length
-  }
-
-  /** 项目 cursor 路径 */
   function cursorPath() {
     return join(directory, CURSOR_FILE)
   }
 
-  /** 读项目 AGENTS.md 概述 (前 50 行匹配 OVERVIEW_MARKER)。无概述 → '' */
+  function readCursorLocal(cursorPathArg = cursorPath()) {
+    try {
+      if (!exists(cursorPathArg)) return null
+      const parsed = JSON.parse(read(cursorPathArg, 'utf8'))
+      if (parsed && typeof parsed === 'object') return parsed
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  function writeCursorLocal(cursorPathArg, cursor) {
+    try {
+      mkdir(join(cursorPathArg, '..'), { recursive: true })
+      write(cursorPathArg, JSON.stringify(cursor, null, 2) + '\n', 'utf8')
+    } catch (error) {
+      log(`CURSOR_WRITE_FAIL path=${cursorPathArg} error=${String(error)}`)
+    }
+  }
+
   function readProjectOverview() {
     const mdPath = join(directory, 'AGENTS.md')
     try {
@@ -675,247 +394,93 @@ function createExperienceReviewer(deps) {
     }
   }
 
-  /** 读 cursor: 用注入的 fs (测试可 mock)。无文件/损坏 → null */
-  function readCursorLocal(cursorPathArg = cursorPath()) {
+  function countMdEntriesSafe() {
     try {
-      if (!exists(cursorPathArg)) return null
-      const parsed = JSON.parse(read(cursorPathArg, 'utf8'))
-      if (parsed && typeof parsed === 'object') return parsed
-      return null
+      const mdPath = join(directory, 'AGENTS.md')
+      return exists(mdPath) ? countMdEntries(read(mdPath, 'utf8')) : 0
     } catch {
-      return null
+      return 0
     }
   }
 
-  /** 写 cursor: 用注入的 fs (测试可 mock) */
-  function writeCursorLocal(cursorPathArg = cursorPath(), cursor) {
+  function readMdSafe() {
     try {
-      mkdir(join(cursorPathArg, '..'), { recursive: true })
-      write(cursorPathArg, JSON.stringify(cursor, null, 2) + '\n', 'utf8')
-    } catch (error) {
-      log(`CURSOR_WRITE_FAIL path=${cursorPathArg} error=${String(error)}`)
+      const p = join(directory, 'AGENTS.md')
+      return exists(p) ? read(p, 'utf8') : ''
+    } catch {
+      return ''
     }
   }
 
   /**
-   * 异步回顾: 读未总结消息 → spawn subagent → 解析 → 写 AGENTS.md / OCM → 更新 cursor
-   * 返回 Promise<boolean>; 任何失败返回 false 且不更新 cursor (下次重试)。
+   * v5 主入口: 处理一次 session.compaction.ended 事件。
+   * 解析 event.data.text → writeSimpleEntries → refreshUsageStamps → cursor 推进。
+   * @returns {{ok:boolean, reason?:string, simple?:Array, usedEntries?:Array}}
    */
-  async function fireReview() {
+  function handleCompactionEnded({ event } = {}) {
     if (!directory) {
-      log(`REVIEW_SKIP reason=no-directory`)
-      return false
+      log(`COMPACTION_SKIP reason=no-directory`)
+      return { ok: false, reason: 'no-directory' }
     }
     if (isDisabled()) {
-      log(`REVIEW_SKIP reason=disabled-by-config`)
-      return false
+      log(`COMPACTION_SKIP reason=disabled-by-config`)
+      return { ok: false, reason: 'disabled' }
     }
-    const projectId = projectIdFn(directory)
-    const dbPath = openCodeDbPath()
-    log(`REVIEW_START project=${projectId} db=${dbPath}`)
-    let db
-    try {
-      db = openDb(dbPath)
-    } catch (error) {
-      log(`REVIEW_OPEN_FAIL error=${String(error)}`)
-      return false
-    }
-    let messages
-    let turnsGroup
-    try {
-      const cursor = readCursorLocal()
-      messages = readUnsumm({
-        db,
-        directory,
-        lastMessageId: cursor?.lastMessageId ?? null,
-        limit: maxMessages,
-      })
-      // 轮次聚合: 只保留完整轮次 (user 段 + assistant 段), 游标推进到最后一个完整轮次末尾
-      turnsGroup = groupIntoTurns(messages)
-    } catch (error) {
-      log(`REVIEW_READ_FAIL error=${String(error)}`)
-      db.close()
-      return false
-    }
-    db.close()
-    if (!messages.length) {
-      log(`REVIEW_SKIP reason=no-new-messages`)
-      return false
-    }
-    if (!turnsGroup.turns.length) {
-      // 有消息但无完整轮次 (全是回复尾巴/悬挂 user) → 不交付, 游标不动, 等下次补齐
-      log(`REVIEW_SKIP reason=no-complete-turns total=${messages.length}`)
-      return false
+    const sessionID = event?.data?.sessionID
+    const text = typeof event?.data?.text === 'string' ? event.data.text : ''
+    if (!text.trim()) {
+      log(`COMPACTION_SKIP reason=empty-text sid=${sessionID ?? '-'}`)
+      return { ok: false, reason: 'empty-text' }
     }
 
-    // 构建 prompt 并直接作为 positional message 传入 (opencode -f 是 attach 语义, 并不可靠)
-    // prompt 超长时按轮次从尾部截断 (游标只推进到已交付的最后一个完整轮次, 不丢数据)
-    let promptText
-    let deliveredTurns = turnsGroup.turns
-    const projectOverview = readProjectOverview()
-    // 当前 AGENTS.md 条目数 → 注入提取提示词容量参考行 (只作参考, 不限制提取)
-    const mdPath = join(directory, 'AGENTS.md')
-    let entryCount = 0
-    try {
-      entryCount = exists(mdPath) ? countMdEntries(read(mdPath, 'utf8')) : 0
-    } catch (error) {
-      log(`MD_COUNT_FAIL path=${mdPath} error=${String(error)}`)
-    }
-    try {
-      promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]), projectOverview, entryCount)
-      while (promptText.length > MAX_PROMPT_CHARS && deliveredTurns.length > 1) {
-        deliveredTurns = deliveredTurns.slice(0, -1)
-        promptText = buildSubagentPrompt(deliveredTurns.flatMap((t) => [...t.user, ...t.assistant]), projectOverview, entryCount)
-        log(`REVIEW_TRUNCATE turned turns=${deliveredTurns.length} len=${promptText.length}`)
-      }
-      if (promptText.length > MAX_PROMPT_CHARS) {
-        log(`REVIEW_INPUT_TOO_LONG len=${promptText.length} max=${MAX_PROMPT_CHARS}`)
-        return false
-      }
-    } catch (error) {
-      log(`REVIEW_INPUT_BUILD_FAIL error=${String(error)}`)
-      return false
+    // cursor 去重: 同 event.id 不重复处理 (auto + manual compact 都走同一路径)
+    const cur = readCursorLocal(cursorPath()) ?? {}
+    const eventID = typeof event?.id === 'string' ? event.id : null
+    if (eventID && cur.lastCompactionEventID === eventID) {
+      log(`COMPACTION_SKIP reason=duplicate-event sid=${sessionID ?? '-'} event=${eventID}`)
+      return { ok: false, reason: 'duplicate' }
     }
 
-    // spawn subagent
-    const res = await runSub({ prompt: promptText, cwd: directory })
-    if (!res.ok) {
-      log(`REVIEW_SUBAGENT_FAIL code=${res.code ?? '-'} reason=${res.reason ?? '-'} stderr=${(res.stderr || '').slice(-300)}`)
-      return false
-    }
+    const { simple, usedEntries } = parseReviewOutput(text)
+    log(
+      `COMPACTION_REVIEW sid=${sessionID ?? '-'} textLen=${text.length} ` +
+        `simple=${simple.length} used=${usedEntries.length} reason=${event?.data?.reason ?? '-'}`
+    )
 
-    // 解析 + 写入
-    const { simple, complex } = parseReviewOutput(res.stdout)
-    log(`REVIEW_PARSE simple=${simple.length} complex=${complex.length} stdoutLen=${res.stdout.length}`)
+    const before = readMdSafe()
     if (simple.length) writeSimpleEntries(simple)
+    if (usedEntries.length) refreshUsageStamps(usedEntries)
+    const after = readMdSafe()
+    const wrote = before !== after
 
-    // 复杂经验: OCM store 无去重 → 先查现有 title, 已存在跳过
-    let existingTitles = new Set()
-    if (complex.length) {
-      try {
-        const q = await queryExp({ scope: 'all', type: 'all', topK: 500, projectId })
-        if (q?.success) existingTitles = new Set(q.experiences.map((x) => x.title))
-      } catch { /* 查重失败不阻塞, 视为无重复 */ }
-    }
-
-    let complexOk = true
-    for (const e of complex) {
-      if (existingTitles.has(e.title)) {
-        log(`COMPLEX_DEDUP title="${e.title}"`)
-        continue
-      }
-      const ok = await storeComplex(e, { projectId })
-      if (!ok?.success) complexOk = false
-    }
-    if (complex.length && complexOk === false) {
-      // 复杂经验写入失败 → 不更新 cursor (下次重试)
-      log(`REVIEW_COMPLEX_FAILED complex=${complex.length} → cursor 保持, 下次重试`)
-      return false
-    }
-
-    // 更新 cursor: 推进到已交付轮次的最后一个完整轮次末尾 (不是全局最后一条消息)
-    const lastDelivered = deliveredTurns[deliveredTurns.length - 1]
-    const lastMessageId = lastDelivered
-      ? lastDelivered.assistant[lastDelivered.assistant.length - 1]?.message_id ?? null
-      : null
-    if (!lastMessageId) {
-      log(`REVIEW_SKIP reason=no-cursor-progress`)
-      return false
-    }
-    const cur = readCursorLocal() ?? {}
-    // 缓存命中率统计: 读最近 EXP_EXTRACTOR 会话的 step-finish tokens (拿不到不阻塞 REVIEW_DONE)
-    let lastCacheHitRate = null
-    try {
-      const dbC = openDb(dbPath)
-      try {
-        lastCacheHitRate = readLastSubagentUsage(dbC, SUBAGENT_SESSION_TITLE)?.hitRate ?? null
-      } finally {
-        dbC.close()
-      }
-    } catch (error) {
-      log(`REVIEW_CACHE_STATS_FAIL error=${String(error)}`)
-    }
     writeCursorLocal(cursorPath(), {
       ...cur,
-      lastMessageId,
-      lastReviewAt: new Date().toISOString(),
-      ...(lastCacheHitRate !== null ? { lastCacheHitRate } : {}),
+      lastCompactionEventID: eventID,
+      lastCompactionAt: new Date(now()).toISOString(),
+      ...(wrote ? { lastWriteAt: new Date(now()).toISOString() } : {}),
     })
+
     log(
-      `REVIEW_DONE cursor=${lastMessageId} turns=${deliveredTurns.length} simple=${simple.length} ` +
-        `complex=${complex.length} cacheHitRate=${lastCacheHitRate ?? '-'}`
+      `COMPACTION_DONE sid=${sessionID ?? '-'} event=${eventID ?? '-'} ` +
+        `simpleWrote=${simple.length} usedWrote=${usedEntries.length} wroteFile=${wrote}`
     )
-    return true
+    return { ok: true, simple, usedEntries }
   }
 
   /**
-   * transform hook 入口。触发状态只认项目路径 (cursor 文件), 与 session 无关:
-   * 换 session / 重启 / 任何 agent 在本项目下的对话, 共享同一份触发状态。
-   * 触发 → 异步 fireReview (fire-and-forget, 不阻塞主会话)。
+   * v5 hook 注入构造: opencode 在 compact 调模型前触发 session.compaction hook,
+   * 我们返回把 extraction 指令追加到末尾的新 messages 数组。
+   * 返回 null / undefined = opencode 用原 messages 继续 (无副作用)。
    */
-  function handleTransform({ messages = [] } = {}) {
-    if (!Array.isArray(messages) || messages.length === 0) return
-    if (isDisabled()) return // 按项目关闭 → 完全跳过 (零开销, 不写 cursor 不触发)
-    const userCount = userMessageCount(messages)
-    const cursor = readCursorLocal() ?? {}
-    const lastReviewRound = typeof cursor.lastReviewRound === 'number' ? cursor.lastReviewRound : 0
-    const lastReviewAtMs =
-      typeof cursor.lastReviewAt === 'string'
-        ? Date.parse(cursor.lastReviewAt)
-        : typeof cursor.lastReviewAt === 'number'
-          ? cursor.lastReviewAt
-          : now()
-    if (lastReviewRound === 0) {
-      // 首次: 基线, 避免开局立即触发
-      writeCursorLocal(cursorPath(), {
-        ...cursor,
-        lastReviewRound: userCount,
-        lastReviewAt: new Date(lastReviewAtMs).toISOString(),
-      })
-      return
-    }
-    // clamp 负数: 流式增量 / 消息回退不产生负 diff (修 rounds=-2)
-    const roundsSince = Math.max(0, userCount - lastReviewRound)
-    const timeSince = now() - lastReviewAtMs
-    const roundHit = roundsSince >= roundInterval
-    const timeHit = timeSince >= timeIntervalMs
-    if (!roundHit && !timeHit) {
-      // 统计字段随每次 transform 落盘 (cursor 文件 = 同路径统计真相源)
-      writeCursorLocal(cursorPath(), {
-        ...cursor,
-        userCount,                    // 累计用户消息条数 (当前 session)
-        roundsSince,                  // 距上次回顾轮数差
-        timeSinceMs: timeSince,       // 距上次回顾毫秒
-      })
-      log(
-        `TRANSFORM_WATCH rounds=${roundsSince}/${roundInterval} ms=${timeSince}/${timeIntervalMs} userCount=${userCount}`
-      )
-      return
-    }
-
-    // 触发 → 双冷却重置 (任一先触发, 两个都进入冷却)
-    writeCursorLocal(cursorPath(), {
-      ...cursor,
-      lastReviewRound: userCount,
-      lastReviewAt: new Date(now()).toISOString(),
-    })
-    log(`TRIGGER roundHit=${roundHit} timeHit=${timeHit} userCount=${userCount}`)
-
-    if (reviewInFlight) {
-      log(`REVIEW_SKIP reason=already-in-flight`)
-      return
-    }
-    reviewInFlight = true
-    fireReview().finally(() => {
-      reviewInFlight = false
-    })
+  function buildCompactionInjection() {
+    if (!directory) return null
+    if (isDisabled()) return null
+    const overview = readProjectOverview()
+    const entryCount = countMdEntriesSafe()
+    return extractionInstructionForCompact(overview, entryCount)
   }
 
-  /**
-   * 简单经验写入项目 AGENTS.md (v2.2: 取消 subagent 直写全局)。
-   * 全部写项目 MD; 疑似全局条目加 `[建议全局] ` 前缀, 由主 agent 当面向用户确认后迁全局。
-   * 去重按原文 (前缀不参与); 大小上限保持。
-   */
+  // ── AGENTS.md 写入 (v5 主落点) ──
   function writeSimpleEntries(entries) {
     if (!entries.length) return
     const path = join(directory, 'AGENTS.md')
@@ -931,12 +496,12 @@ function createExperienceReviewer(deps) {
       const text = e?.text
       if (!text) continue
       if (text.length > SIMPLE_MAX_CHARS) {
-        // 护栏: 超长 simple 拒绝落盘 (提示词已要求 ≤50 字, 兜底防 LLM 百字长句冒充)
         log(`MD_TOO_LONG chars=${text.length} max=${SIMPLE_MAX_CHARS} skipped="${text.slice(0, 30)}…"`)
         continue
       }
       if (existing.includes(text) || added.includes(text)) continue // 去重 (原文)
-      const line = `- ${e.suggestGlobal ? `[建议全局] ${text}` : text}`
+      const stamp = `[${dateStamp(now())}] `
+      const line = `- ${e.suggestGlobal ? `${SUGGEST_GLOBAL_MARKER}${stamp}${text}` : `${stamp}${text}`}`
       if ((existing + added + line).length > maxMdBytes) {
         log(`MD_FULL maxBytes=${maxMdBytes} skipped="${text}"`)
         continue
@@ -957,14 +522,53 @@ function createExperienceReviewer(deps) {
   }
 
   /**
-   * 项目概述提醒 (v2.2 → v2.5 改 persistent): 读项目 AGENTS.md 前 50 行,
-   * 匹配 `> **项目概述**: ` 标记。缺 → 每次 user-turn transform 都注入提醒
-   * (用户要求「未写入就一直提醒直到写入为止」); 补写后 → 记 cursor.hasOverview 永久停。
-   * v2.5 移除 one-shot (cursor.overviewPrompted 字段废弃): 旧设计为「首次提醒后永不再提醒」,
-   * 导致 task() 派生的 subagent session 抢先触发一次后, 主 agent 永久收不到这条提示,
-   * 与「未写入就一直提醒」的设计意图冲突。
-   * 不能用 `# 标题` 判断 (全局 AGENTS.md 首行就是 `# ...` 会误判)。
+   * 用后刷新: 已存过的条目若本对话应用过, 把日期戳刷新到当天。
+   * 仅改时间戳不动内容; 结果超 maxMdBytes 则跳过写盘。
    */
+  function refreshUsageStamps(fragments) {
+    if (!Array.isArray(fragments) || !fragments.length) return 0
+    const cleaned = fragments
+      .map((f) => stripEntryStamp(f).trim())
+      .filter((f) => f.length >= 3)
+    if (!cleaned.length) return 0
+    const path = join(directory, 'AGENTS.md')
+    let content = ''
+    try {
+      content = exists(path) ? read(path, 'utf8') : ''
+    } catch (error) {
+      log(`STAMP_READ_FAIL path=${path} error=${String(error)}`)
+      return 0
+    }
+    const stamp = `[${dateStamp(now())}]`
+    let updated = 0
+    const lines = content.split('\n').map((line) => {
+      if (!line.trim().startsWith('- ')) return line
+      const body = stripEntryStamp(line)
+      if (!body || !cleaned.some((f) => body.includes(f))) return line
+      const next = stampEntryLine(line, stamp)
+      if (next !== line) updated++
+      return next
+    })
+    if (!updated) {
+      log(`MD_STAMP_REFRESH updated=0 fragments=${cleaned.length}`)
+      return 0
+    }
+    const nextContent = lines.join('\n')
+    if (nextContent.length > maxMdBytes) {
+      log(`MD_STAMP_REFRESH_SKIP reason=md-full len=${nextContent.length} max=${maxMdBytes}`)
+      return 0
+    }
+    try {
+      write(path, nextContent, 'utf8')
+      log(`MD_STAMP_REFRESH updated=${updated}`)
+      return updated
+    } catch (error) {
+      log(`STAMP_WRITE_FAIL path=${path} error=${String(error)}`)
+      return 0
+    }
+  }
+
+  // ── 项目级 4 项提醒 (context hook 触发, 与 compact 流程正交) ──
   function ensureOverviewReminder({ messages = [] } = {}) {
     if (isDisabled()) return
     const cursor = readCursorLocal(cursorPath()) ?? {}
@@ -988,24 +592,15 @@ function createExperienceReviewer(deps) {
       }
       return
     }
-    // v2.5: 去掉 cursor.overviewPrompted one-shot 限制, 只要未写入每次 user-turn 都注入
     const lastUser = [...messages]
       .reverse()
-      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+      .find((m) => messageRoleOf(m) === 'user' && messagePartsOf(m))
     if (!lastUser) return
-    // 最小修改: 只在用户新消息到达的 transform 注入; assistant 生成/工具循环阶段跳过
     if (messages[messages.length - 1] !== lastUser) return
-    // 与 task-context-injector 同款: synthetic part 追加到最后一条 user 消息
-    lastUser.parts.push({ type: 'text', text: `\n\n${OVERVIEW_REMINDER}`, synthetic: true })
+    appendSyntheticText(lastUser, `\n\n${OVERVIEW_REMINDER}`)
     log(`OVERVIEW_REMINDER injected (recurring until written)`)
   }
 
-  /**
-   * [建议全局] 询问提醒 (v2.2): 扫描项目 AGENTS.md 中 `- [建议全局] ` 开头的条目。
-   * 有 → 注入提醒, 让主 agent 当面向用户询问: 升级→移入全局 AGENTS.md; 不升级→删除前缀。
-   * 防刷屏: cursor.suggestGlobalPromptedCount 存「上次提醒时的条数」; 回落(处理/清零)时重置基线,
-   * 条数涨回超过基线才重新提醒 (不存历史峰值, 防清理后再涨回同值被静默吞掉)。
-   */
   function ensureSuggestGlobalReminder({ messages = [] } = {}) {
     if (isDisabled()) return
     const mdPath = join(directory, 'AGENTS.md')
@@ -1021,35 +616,26 @@ function createExperienceReviewer(deps) {
       .filter((line) => line.trim().startsWith('- ' + SUGGEST_GLOBAL_MARKER)).length
     const cursor = readCursorLocal(cursorPath()) ?? {}
     const lastCount = cursor.suggestGlobalPromptedCount ?? 0
-    // 回落 (含清零) → 重置基线: 用户处理过部分条目, 下次新增时能再次提醒
     if (count < lastCount) {
       writeCursorLocal(cursorPath(), { ...cursor, suggestGlobalPromptedCount: count })
       return
     }
     if (count === 0) return
-    if (count === lastCount) return // 同值不重复提醒
+    if (count === lastCount) return
     const lastUser = [...messages]
       .reverse()
-      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+      .find((m) => messageRoleOf(m) === 'user' && messagePartsOf(m))
     if (!lastUser) return
     if (messages[messages.length - 1] !== lastUser) return
     const reminder =
       `【必须执行】项目 AGENTS.md 中有 ${count} 条以 \`[建议全局] \` 开头的经验。` +
       `请逐条当面向用户询问是否升级为全局经验: 用户同意 → 移动到全局 AGENTS.md; 不同意 → 删除 \`[建议全局] \` 前缀。` +
       `不得跳过、不得推迟, 处理完所有条目才算满足要求。`
-    lastUser.parts.push({ type: 'text', text: `\n\n${reminder}`, synthetic: true })
+    appendSyntheticText(lastUser, `\n\n${reminder}`)
     writeCursorLocal(cursorPath(), { ...cursor, suggestGlobalPromptedCount: count })
     log(`SUGGEST_GLOBAL_REMINDER injected count=${count}`)
   }
 
-  /**
-   * 经验回收提醒 (v2.3/v2.4): 项目 AGENTS.md 经验条目数 ≥ RECYCLE_THRESHOLD (100) 时,
-   * 注入提醒让主 agent 按 7 个方向逐条清理 (删除/合并/迁移)。
-   * 判据只有上限一条: 达标就一直提醒, 压回上限以下自动停。
-   * (v2.3 前曾用 cursor.recyclePromptedCount 存「上次提醒时的条数」做同值静默,
-   *  回落重置时又把基线写成当前值 → 清理到仍超上限时被自己锁死, 已删除该层。)
-   * 限流靠「最新一条必须是 user 消息」, 天然一轮最多注入一次。
-   */
   function ensureRecycleReminder({ messages = [] } = {}) {
     if (isDisabled()) return
     const mdPath = join(directory, 'AGENTS.md')
@@ -1064,32 +650,27 @@ function createExperienceReviewer(deps) {
     if (count < RECYCLE_THRESHOLD) return
     const lastUser = [...messages]
       .reverse()
-      .find((m) => m?.info?.role === 'user' && Array.isArray(m.parts))
+      .find((m) => messageRoleOf(m) === 'user' && messagePartsOf(m))
     if (!lastUser) return
     if (messages[messages.length - 1] !== lastUser) return
     const target = recycleTargetCount()
-    // 目录名做项目标识: 尾部分隔符要一并剥掉 (根目录 '/' → 空)
     const projectName = directory.split(/[\\/]/).filter(Boolean).pop() ?? '未知项目'
     const reminder =
-      `【${projectName}】*必须执行* 项目 AGENTS.md 经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
-      `逐条过现有条目, 命中即处理 (删除/合并/迁移), 每条给出原文和理由:\n` +
-      `1. 不符合存储门槛 → 删。门槛 = 用户偏好 / 用户纠正 / 无法从代码推导的项目决策 / 反复踩的工程坑; skill 与领域专属经验不在门槛内\n` +
-      `2. 已解决的问题\n` +
-      `3. 重复/同义\n` +
-      `4. 作用域错位 (与本项目无关的工具链坑)\n` +
-      `5. 同一主题拆成多条\n` +
-      `6. 低频场景占常驻\n` +
+      `【${projectName}】AGENTS.md 经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
+      `你自处理即可, 不必逐条展开处理过程——可在任务间隙按以下标准顺手处理:\n` +
+      `1. 准入门槛 + 可复用性: 必须是「可参考、可执行的规范」+ 未来会被反复应用; 拒绝事实性描述/一次性描述(已交付产物写法)/与项目概述重叠/行业平台公开知识\n` +
+      `2. 已解决\n` +
+      `3. 重复同义\n` +
+      `4. 作用域错位\n` +
+      `5. 同一主题拆多条\n` +
+      `6. 低频占常驻\n` +
       `7. 依赖环境已变化\n` +
-      `约束: 删除系统文件或全局 AGENTS.md 前先向用户说明; 完成后回报原条数 → 新条数, 以及各类方向各删/合并/迁了几条; 不得跳过推迟。`
-    lastUser.parts.push({ type: 'text', text: `\n\n${reminder}`, synthetic: true })
+      `8. 长期未用: 时间戳久未刷新(或无时间戳且创建已久)的条目 → 优先审查删除; 结合本会话印象, 拿不准的保留\n` +
+      `不挤占主任务输出带宽, 不必立刻处理。`
+    appendSyntheticText(lastUser, `\n\n${reminder}`)
     log(`RECYCLE_REMINDER injected count=${count}`)
   }
 
-  /**
-   * 全局规则句同步 (v2.2): 全局 AGENTS.md 缺 `[建议全局]` 确认规则句时自动补写。
-   * 用户批准方案: 有则不管 (检测到即跳过), 无则自动写入 (一次性, 写入后下次检测命中不再重复)。
-   * 与 reminder 不同: 不注入对话, 直接落盘全局文件。
-   */
   function ensureGlobalRuleSync({ messages = [] } = {}) {
     if (isDisabled()) return
     const globalMd = globalAgentsPath
@@ -1100,9 +681,8 @@ function createExperienceReviewer(deps) {
       log(`GLOBAL_RULE_READ_FAIL path=${globalMd} error=${String(error)}`)
       return
     }
-    if (content.includes(SUGGEST_GLOBAL_RULE_KEY)) return // 已有规则句(或保留语义的微调版本), 不管
+    if (content.includes(SUGGEST_GLOBAL_RULE_KEY)) return // 已有规则句, 不管
     try {
-      // 追加到全局 AGENTS.md 末尾; 已有内容且不以换行结尾时先补换行, 防止段落粘连
       const sep = content && !content.endsWith('\n') ? '\n' : ''
       write(globalMd, content + sep + SUGGEST_GLOBAL_RULE + '\n', 'utf8')
       log(`GLOBAL_RULE_WRITE path=${globalMd}`)
@@ -1112,10 +692,10 @@ function createExperienceReviewer(deps) {
   }
 
   return {
-    handleTransform,
-    fireReview,
-    parseReviewOutput,
+    handleCompactionEnded,
+    buildCompactionInjection,
     writeSimpleEntries,
+    refreshUsageStamps,
     ensureOverviewReminder,
     ensureSuggestGlobalReminder,
     ensureRecycleReminder,
@@ -1123,55 +703,161 @@ function createExperienceReviewer(deps) {
     readCursor: readCursorLocal,
     writeCursor: writeCursorLocal,
     isDisabled,
+    parseReviewOutput,
+    extractionInstructionForCompact,
   }
 }
 
+// ── 插件入口 (v5: opencode 2.x) ──
 const plugin = {
   id: 'opencode-experience-reviewer',
-  server: async ({ directory }) => {
-    // 启动即确保项目统计目录 .experience-reviewer/ 存在 (插件自有, 不寄生 .omo)
-    const omoDir = join(directory, '.experience-reviewer')
-    try {
-      mkdirSync(omoDir, { recursive: true })
-      debugLog(`ERO_DIR_READY path=${omoDir}`)
-    } catch (error) {
-      debugLog(`ERO_DIR_FAIL path=${omoDir} error=${String(error)}`)
-    }
+  setup: async (ctx) => {
     debugLog(
-      `server() STARTED ${MARKER} v2 roundInterval=${ROUND_INTERVAL} ` +
-        `timeIntervalMs=${TIME_INTERVAL_MS} maxMdBytes=${MAX_MD_BYTES} ` +
-        `maxMessages=${MAX_MESSAGES} model=${REVIEW_MODEL ?? '(default)'} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5(compact-hook) maxMdBytes=${MAX_MD_BYTES} enabled=${ENABLED}`
     )
     if (!ENABLED) {
-      debugLog('server() DISABLED (ENABLED=false)')
-      return {}
+      debugLog('setup() DISABLED (ENABLED=false)')
+      return () => {}
     }
-    const reviewer = createExperienceReviewer({ directory })
-    return {
-      'experimental.chat.messages.transform': async (input, output) => {
-        // 职责分离: handleTransform 只做触发检测 (零注入), 其余四个提醒单独注入
-        reviewer.handleTransform({ messages: output?.messages })
-        reviewer.ensureOverviewReminder({ messages: output?.messages })
-        reviewer.ensureSuggestGlobalReminder({ messages: output?.messages })
-        reviewer.ensureRecycleReminder({ messages: output?.messages })
-        reviewer.ensureGlobalRuleSync({ messages: output?.messages })
-      },
+
+    /** sessionID → {directory, title} (opencode.db 反查, 缓存) */
+    const sessionMeta = new Map()
+    /** directory → reviewer 实例 (同项目多会话共享) */
+    const reviewers = new Map()
+
+    function metaFor(sessionID) {
+      if (!sessionID) return null
+      if (sessionMeta.has(sessionID)) return sessionMeta.get(sessionID)
+      let meta = null
+      try {
+        const db = openSqlite(openCodeDbPath(), { readOnly: true })
+        try {
+          const row = db.prepare(`SELECT directory, title FROM session_v2 WHERE id = ?`).get(sessionID)
+          if (row?.directory) meta = { directory: row.directory, title: row.title ?? null }
+        } finally {
+          db.close()
+        }
+      } catch (error) {
+        debugLog(`V2_META_FAIL sid=${sessionID} error=${String(error)}`)
+      }
+      if (!meta) debugLog(`V2_META_MISS sid=${sessionID}`)
+      else debugLog(`V2_META sid=${sessionID} dir=${meta.directory} title=${meta.title ?? '-'}`)
+      sessionMeta.set(sessionID, meta)
+      return meta
     }
+
+    function reviewerFor(directory) {
+      const cached = reviewers.get(directory)
+      if (cached) return cached
+      const omoDir = join(directory, '.experience-reviewer')
+      try {
+        mkdirSync(omoDir, { recursive: true })
+        debugLog(`ERO_DIR_READY path=${omoDir}`)
+      } catch (error) {
+        debugLog(`ERO_DIR_FAIL path=${omoDir} error=${String(error)}`)
+      }
+      const reviewer = createExperienceReviewer({ directory })
+      reviewers.set(directory, reviewer)
+      return reviewer
+    }
+
+    // ── hook 1: context (项目级 4 项提醒) ──
+    ctx.session.hook('context', (event) => {
+      try {
+        const messages = event?.messages
+        if (!Array.isArray(messages) || messages.length === 0) return
+        const meta = metaFor(event?.sessionID)
+        if (!meta?.directory) return
+        const reviewer = reviewerFor(meta.directory)
+        reviewer.ensureOverviewReminder({ messages })
+        reviewer.ensureSuggestGlobalReminder({ messages })
+        reviewer.ensureRecycleReminder({ messages })
+        reviewer.ensureGlobalRuleSync({ messages })
+      } catch (error) {
+        debugLog(`V2_CONTEXT_HOOK_FAIL ${String(error)}`)
+      }
+    })
+
+    // ── hook 2: compaction (注入提取指令, V2 范式: mutate event) ──
+    // V1 写法 (return { messages: [...] }) 在 V2 SDK 下被忽略 —— V2 callback
+    // 只接受 mutate event 自身. event.messages 是 SDK 提供的 transcript 引用,
+    // push 进去即 SDK 采纳. 若 event.messages 不是数组 (V2 SDK 偶发),
+    // 打 COMPACTION_NO_MUTABLE_MESSAGES 告警但不抛错.
+    ctx.session.hook('compaction', (event) => {
+      try {
+        const meta = metaFor(event?.sessionID)
+        if (!meta?.directory) return // 不返回 = opencode 用原 messages 继续
+        const reviewer = reviewerFor(meta.directory)
+        const injection = reviewer.buildCompactionInjection()
+        if (!injection) return
+        if (!Array.isArray(event?.messages)) {
+          debugLog(
+            `COMPACTION_NO_MUTABLE_MESSAGES sid=${event?.sessionID ?? '-'} ` +
+              `keys=${Object.keys(event || {}).join(',')}`
+          )
+          return
+        }
+        const before = event.messages.length
+        event.messages.push(injection)
+        debugLog(
+          `COMPACTION_INJECT_V2 sid=${event?.sessionID ?? '-'} before=${before} after=${event.messages.length}`
+        )
+      } catch (error) {
+        debugLog(`COMPACTION_HOOK_FAIL_V2 ${String(error)}`)
+      }
+    })
+
+    // ── event: 订阅 session.compaction.ended / .failed ──
+    try {
+      const stream = ctx.event.subscribe()
+      ;(async () => {
+        try {
+          for await (const evt of stream) {
+            if (!evt || typeof evt !== 'object') continue
+            if (evt.type === 'session.compaction.ended') {
+              try {
+                const meta = metaFor(evt.data?.sessionID)
+                if (!meta?.directory) {
+                  debugLog(`COMPACTION_NO_DIR sid=${evt.data?.sessionID ?? '-'}`)
+                  continue
+                }
+                const reviewer = reviewerFor(meta.directory)
+                reviewer.handleCompactionEnded({ event: evt })
+              } catch (error) {
+                debugLog(`COMPACTION_ENDED_HANDLER_FAIL ${String(error)}`)
+              }
+            } else if (evt.type === 'session.compaction.failed') {
+              debugLog(
+                `COMPACTION_FAILED sid=${evt.data?.sessionID ?? '-'} ` +
+                  `error="${evt.data?.error?.message ?? '-'}"`
+              )
+            }
+          }
+        } catch (error) {
+          debugLog(`EVENT_STREAM_BROKEN ${String(error)}`)
+        }
+      })()
+    } catch (error) {
+      debugLog(`EVENT_SUBSCRIBE_FAIL ${String(error)}`)
+    }
+
+    return () => {}
   },
 }
 
 export default plugin
 export {
   createExperienceReviewer,
-  buildSubagentPrompt,
   parseReviewOutput,
   extractJsonBlock,
-  readUnsummarizedMessages,
-  groupIntoTurns,
+  extractionInstructionForCompact,
   projectIdFromCwd,
-  openCodeDbPath,
   storeComplexExperience,
   queryExperiences,
-  computeCacheStats,
-  readLastSubagentUsage,
+  // 基础工具 (测试 & 后续使用)
+  countMdEntries,
+  dateStamp,
+  stripEntryStamp,
+  stampEntryLine,
+  normalizeProjectDir,
 }
