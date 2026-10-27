@@ -1,4 +1,4 @@
-# experience-reviewer — OpenCode 会话经验回顾插件 (mission 161, v2.3)
+# experience-reviewer — OpenCode 会话经验回顾插件 (mission 161, v2.7)
 
 ## 解决什么问题
 对话中产生的**可复用经验**（一句话规则 / 多行使用规范）随会话结束而丢失。
@@ -37,12 +37,21 @@ hook 检测到 轮次/时间 触发 ──→  spawn `opencode run --pure` (suba
 - **subagent 纯净模式**：`opencode run --pure <prompt>`（prompt 文本直接作为 positional message；不加载外部插件/无 MCP），
   binary 优先 npm 全局 exe（`.../npm/node_modules/opencode-ai/bin/opencode.exe`），避免 shell 转义中文。
   ⚠️ 勿用 `-f` 传输入：当前 opencode 的 `-f/--file` 是"附加文件到消息"而非"从文件读 prompt"，只传 `-f` 不传 message 会报 `You must provide a message or a command`
-- **简单经验写入（v2.2）**：全部写项目 `<项目根>/AGENTS.md`；疑似全局条目（`suggestGlobal=true`）
+- **简单经验写入（v2.2，v2.7 盖时间戳）**：全部写项目 `<项目根>/AGENTS.md`；疑似全局条目（`suggestGlobal=true`）
   加 `[建议全局] ` 前缀，等主 agent 当面向用户确认后迁全局（规则见全局 AGENTS.md）；去重 + 20KB 上限
-  （`MAX_MD_BYTES`），超限跳过并告警（原因同 v1，见 §"为什么 20KB"）
-- **提取排除规则（v2.2）**：subagent 提示词内置硬排除——能从代码/文档推导的信息、当次任务一次性安排、
+  （`MAX_MD_BYTES`），超限跳过并告警（原因同 v1，见 §"为什么 20KB"）。
+  v2.7 起落盘即盖创建戳 `- [YYYY-MM-DD] 文本`（标记 `[建议全局] ` 恒在日期之前，不破坏前缀计数），
+  供「用后刷新 + 长期未用清理」判据
+- **提取排除规则（v2.2，v2.6 扩展，v2.7 加规则 9）**：subagent 提示词内置硬排除——能从代码/文档推导的信息、当次任务一次性安排、
   特定 skill/领域专属经验（如 job-hunter 判岗、画图风格）、已存过/高度相似内容，一律不提取；
-  归属拿不准默认 project，不猜全局
+  v2.6 追加三类直述拒绝项（一次性描述=已交付产物写法/与项目概述 `> **项目概述**: ` 行重叠/行业平台公开知识会变）
+  + 规则 7 可复用性反问（「未来会被 agent 在本项目多轮工作中反复应用吗?」不会 → 拒绝入库）；
+  v2.7 追加规则 9：输出前必读项目 AGENTS.md 对照已有条目——同义不重复、矛盾不提取、同主题不加第二条，
+  本批应用过的已有条目记入 `usedEntries`（返回该条目前 10 字符）→ 触发时间戳刷新；
+  归属拿不准默认 project，不猜全局。⚠️ 拒绝项一律**直述字面含义**，不引用「模式 A/C/D」编号——subagent 纯净模式无该上下文
+- **时间戳刷新（v2.7）**：`refreshUsageStamps` 按 `usedEntries` 命中条目行把时间戳刷为当天（旧日期替换、
+  无日期插入、只改时间戳不动内容）；片段剥前缀/截 10 字/≥3 字符过滤，无命中或超 20KB 不写盘；
+  失败只记日志不阻塞 cursor。漏报安全：全体显老 → 退化为粗筛，不误删
 - **项目概述提醒（v2.2 → v2.5 改 persistent）**：`server` 层追加 `ensureOverviewReminder`——读 `<项目根>/AGENTS.md` 前 50 行，
   匹配 `> **项目概述**: ` 标记（顶部首行格式）；缺 → **每次 user-turn transform 都注入提醒**
   （v2.5 移除 cursor `overviewPrompted` one-shot 限制，废弃该字段——旧设计让 task() 派生的 subagent
@@ -54,11 +63,50 @@ hook 检测到 轮次/时间 触发 ──→  spawn `opencode run --pure` (suba
   **代码判据只有一条：`count >= RECYCLE_THRESHOLD` 就提醒，无基线、无同值静默、无回落重置**，
   达标期间每轮都提醒。**注入正文只报两样：当前状态（已达 N 条）+ 目标状态（压到 M 条以内）**，
   不向上下文暴露上限数值、不设完成判据——`RECYCLE_THRESHOLD` 纯属插件内部触发线。
-  正文另给 **7 个可判定清理方向**（不符合存储门槛 / 已解决 / 重复同义 / 作用域错位 /
-  同一主题拆多条 / 低频占常驻 / 依赖环境已变化）+ 正向声明的门槛白名单 + 硬约束
+  正文另给 **8 个可判定清理方向**（准入门槛+可复用性=事实性描述/一次性描述/与概述重叠/行业平台知识 / 已解决 / 重复同义 / 作用域错位 /
+  同一主题拆多条 / 低频占常驻 / 依赖环境已变化 / 长期未用=时间戳久未刷新优先审查，v2.6 第 1 条与存储侧规则 3/7 对齐，
+  v2.7 第 8 条基于时间戳、不绑 OCM）+ 正向声明的门槛白名单 + 硬约束
   （删系统文件前先问用户、完成后回报条数变化与分类计数）。限流靠「最新一条必须是 user 消息」，一轮最多注入一次。
   ⚠️ 已修 bug，勿加回：v2.3 前用 cursor `recyclePromptedCount` 存「上次提醒时的条数」做同值静默，
   回落重置时又把基线写成当前值 → 清理到仍超上限时被自己锁死永久静默
+- **回归主线锚点（2026-10-27）**：`appendSyntheticText()` 在推完任何一条提醒后，**再推一条**「回归主线」
+  合成 part——把用户本轮原话重述一次 + 声明「上面这条系统任务是插进来的附带项，做完回原任务」。
+  动机：提醒是插件插进来的**系统子任务**，落在用户原话之后 → 模型读到的是系统任务，
+  做完就停在系统任务上、忘了原任务（用户侧表现为「加完油不继续上路」）。
+  实现要点：原话 = 同一条 user 消息里**非 `synthetic`** 的 text part（插件注入都带 `synthetic`）；
+  锚点带 `mainline:true` 私有标记（**不用文本匹配**，避免误删用户自己写的同名字符串）；
+  追加新提醒前先摘掉旧锚点 → 同回合多条提醒时**锚点始终在最后一条、且只保留一份**；
+  原话超 `MAINLINE_MAX_LEN`（300）截断并提示「完整原文见本消息上文」；无原话不生成锚点。
+  纯提示词，不新增文件/不改配置；每条注入多约 80 token
+- **⚠️ JSON 提取解析修复（v5.1，2026-10-28，已修 bug，勿加回）**：`extractJsonBlock()` 原为
+  `init` 遗留（994a6cd），隐含假设「整段文本只有一个 JSON 块」。v5 改用 **compact 摘要全文**
+  （`event.data.text`）当提取输入后该假设失效：摘要正文常提到 ` ```json ` 字面量
+  （如用户需求里写「末尾附 ```json 块」），首个 ``` 匹配会从正文那个字面量一路吞到真正 JSON 块的
+  结束围栏 → 切出的 `{ }` 中段是散文 → `JSON.parse` 抛错**被 catch 静默吞掉** → 整批经验丢失
+  （实测 v5 时代 66 次压缩丢 13 批 / 81 条；丢失原因 100% 吻合「摘要里 ```json 出现 ≥2 次」）。
+  修法（改动面 = 1 个函数）：保留「首个 ``` 匹配」为**首选候选**（行为完全不变），仅当其解析失败时
+  再依次尝试所有 ` ```json ` 块（从后往前）。798 个真实历史摘要全量回归：救回 14 批 85 条、
+  **回归 0**、**解析结果内容变化 0**。踩坑：JS 的 `String.lastIndexOf` 只有两个参数
+  （第二参是 position），照搬 Python `rfind(sub, start, end)` 三参数语义 → 索引不递减 →
+  死循环 → 32s OOM；必须用 `[...text.matchAll(/```json/g)].map(m => m.index)` 一次取全部位置
+- **⚠️ 条目长度口径改「词数」（v5.2，2026-10-28，已修 bug）**：v5.1 及以前代码用 `text.length > 50`
+  判「超长不写盘」，而提示词写的是「≤50 字」。中文语境下模型把「50 字」理解成 **50 个汉字**，
+  而 `text.length` 把每个英文字母/标点/空格各算 1 → **两把尺子，规则不可执行**：
+  模型认为达标的条目（汉字仅 24~30）被代码判成 58~81 字符 → 静默丢弃。
+  实测历史 299 条提取里 **117 条（39%）** 这么被丢，63 个有提取的批次里 15 个全军覆没
+  （`MD_TOO_LONG` → `MD_NOOP` → `wroteFile=false`，日志上看不出失败）。
+  改法：新增 `wordCount(text)` = **汉字数 + 英文单词数**（一个标识符算一词，连字符算标识符内部），
+  提示词规则 1 同步改成「≤35 词」→ 提示词与代码同一把尺子，模型可自行估算。
+  **35 词的依据**（374 条真实历史条目实测，配 120 字符硬顶）：
+  门槛 30 → 丢弃 13.2%（纯中文条目丢 20.2%，误伤明显）；门槛 35 → 丢弃 **3.4%**
+  （纯中文丢 3.6%，通过项 max token 41.2）；门槛 38 → 丢弃 2.1%（max token 43.1）。
+  取 35：丢弃率比旧口径（32.4%）低一个数量级，token 预算与现状（max 39.6）持平。
+  **另配 120 字符硬顶**：词数口径只数「有几个词」，对无空格长串（base64 / 长标识符 / 整段代码）
+  会算成 1 个词而放行；374 条真实样本实测最长英文 token 仅 25 字符、词数≤35 的通过项最长 113 字符，
+  故 120 硬顶在真实数据上零损失。
+  **798 个真实历史摘要全量回归**：丢弃率 31.7% → **3.5%**，新放行 107 条（均为含英文的真实好经验），
+  误丢 2 条（同一句重复出现），旧通过集 236 条**内容零变化**。
+  环境变量：`EXP_SIMPLE_MAX_WORDS`（默认 35，替换旧的 `EXP_SIMPLE_MAX_CHARS`）。
 - **⚠️ 不拦截写入（v2.4，勿加回）**：v2.3 曾让 `buildSubagentPrompt` 在达上限时**禁止 subagent 新增**
   （simple 强制空数组，改输出 `prune` 清单）。该机制**已整体移除**，理由有二：
   ① 清理设计本就是「给一套 7 条规则，主 agent 自行判断」，不需要另一条产出清单的旁路；
@@ -85,10 +133,12 @@ hook 检测到 轮次/时间 触发 ──→  spawn `opencode run --pure` (suba
    （`directory` 匹配 + `parent_id IS NULL` + role 过滤 + `time_created > cursor`）→ `groupIntoTurns`
    按轮次聚合，只保留完整轮次（user段+assistant段），prompt 超长时按轮次从尾部截断
 2. 构建 subagent 提示词（prompt 文本，非临时文件）→ `spawn opencode run --pure <prompt>`
-3. 解析输出 JSON：`{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"complex":[...]}`；
-   scope 一律归一为 project，旧 `scope:"global"` 与 `suggestGlobal:true` 归一为 suggestGlobal（不再直写全局）
-4. 简单经验 → `writeSimpleEntries`（全部写项目 AGENTS.md，suggestGlobal 加 `[建议全局] ` 前缀，去重+上限）；
-   复杂经验 → `storeComplexExperience` stub
+3. 解析输出 JSON：`{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"complex":[...],"usedEntries":[...]}`；
+   scope 一律归一为 project，旧 `scope:"global"` 与 `suggestGlobal:true` 归一为 suggestGlobal（不再直写全局）；
+   `usedEntries`（v2.7）= 本批应用过的已有条目片段（剥前缀/时间戳、截 10 字、≥3 字符过滤）
+4. 简单经验 → `writeSimpleEntries`（全部写项目 AGENTS.md，suggestGlobal 加 `[建议全局] ` 前缀、
+   落盘盖创建时间戳，去重+上限）；复杂经验 → `storeComplexExperience` stub；
+   `usedEntries` 命中 → `refreshUsageStamps` 刷新已有条目时间戳（写盘失败只记 `MD_STAMP_REFRESH` 日志，不阻塞）
 5. 全部成功 → 更新 cursor；任何失败 → 不更新（下次重试）
 
 ## 为什么 AGENTS.md 上限取 20KB（50KB 的问题）
@@ -123,6 +173,7 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
 `REVIEW_SKIP`（无新消息）、`REVIEW_PARSE ok=...`（subagent 输出解析成功/失败/超时）、
 `MD_WRITE path=...`（AGENTS.md 落盘，v2.2 只写项目路径）、`OVERVIEW_OK` / `OVERVIEW_REMINDER`
 （项目概述检测/注入）、`EXP_COMPLEX_API_NOT_READY`（OCM API stub）、
+`MD_STAMP_REFRESH updated=N`（时间戳刷新命中数）、`MD_STAMP_REFRESH_SKIP`（超限跳过刷新，v2.7）、
 `REVIEW_DONE`（cursor 已更新）、`MD_FULL`（超限跳过）。
 
 ## 验证方法
@@ -134,7 +185,7 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
    （v2.5 persistent：每次 user-turn transform 都注入，不再 one-shot；补写后下轮 `OVERVIEW_OK hasOverview=true` 永久停）
 5. **复杂经验**：OCM API 就绪后，log 出现 `COMPLEX_STORED`；未就绪则 `EXP_COMPLEX_API_NOT_READY`
    （且 cursor 不推进，下次重试）
-6. **单元测试**：`node --test test/experience-reviewer.test.mjs` 70/70
+6. **单元测试**：`node --test test/experience-reviewer.test.mjs` 80/80
 
 ## 待办（OCM API 协商中）
 - [ ] OCM 侧提供 `POST /experience`（写经验）与 `GET /experience`（查经验，project+global，去重用）
@@ -161,4 +212,15 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
   缺概述时每次 user-turn transform 都注入提醒，直到补写到 `> **项目概述**: ` 才永久停。修复 mission id=200
   根因：旧 one-shot 让 subagent session（task() 派生）抢先触发一次后，主 agent 永久收不到，与「未写入就一直提醒」
   设计意图冲突。单测 70/70 全绿（测试名更新为「v2.5 persistent」语义）、bun smoke 5/5
+- **v2.6（2026-10-07）**：提取准入对齐可复用性——规则 3 追加三类直述拒绝项（一次性描述/与项目概述重叠/
+  行业平台公开知识）；规则 7 追加可复用性反问（「会被 agent 多轮反复应用吗?」不会 → 拒绝入库）；
+  清理提醒第 1 条同步改为「准入门槛 + 可复用性」（两侧判断口径一致）；
+  拒绝项禁止引用「模式 A/C/D」编号（subagent 纯净模式看不懂）；单测 72/72 全绿、bun smoke 5/5
+- **v2.7（2026-10-07）**：提取/清理双向对齐，全程零 OCM 依赖（开源通用）——
+  ① 提示词加规则 9：输出前必读项目 AGENTS.md 去重（同义不重复/矛盾不提取/同主题不加第二条），
+  schema 加 `usedEntries`（返回已应用条目前 10 字符）；
+  ② 写入盖创建时间戳 `- [YYYY-MM-DD] 文本`（`[建议全局] ` 标记恒在日期之前，去重按原文不受戳影响）；
+  ③ `refreshUsageStamps` 按 `usedEntries` 刷新命中条目为当天（无命中/超 20KB 不写盘）；
+  ④ 清理方向 8 长期未用（时间戳久未刷新优先审查，不引用 memory_search/OCM）。
+  单测 80/80 全绿、bun smoke 5/5
 OCM HTTP API 未就绪（stub 已留，不影响简单经验链路）。

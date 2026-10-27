@@ -8,10 +8,12 @@
  *   3. busy → idle → disarm → 不 abort
  *   4. tool.execute.before 豁免 → after 恢复计时 → abort
  *   5. 工具执行中超时到期 → 不 abort (等第三方返回场景)
+ *   6. 多 session 独立计时 / session.deleted 清理
+ *   7. V2 事件名 → V1 形状映射 (v2EventToV1) + V2 序列端到端 (场景 8-11)
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createWatchdog } from '../index.js'
+import { createWatchdog, v2EventToV1 } from '../index.js'
 
 /** 假时钟 + 假 timer: 完全同步控制 */
 function fakeDeps({ stallTimeoutMs = 1000, abortTimeoutMs = 100 } = {}) {
@@ -150,4 +152,95 @@ test('session.deleted → 状态清理 → 不再 abort', async () => {
   await wd.handleEvent({ type: 'session.deleted', properties: { sessionID: 's1' } })
   advance(2000)
   assert.equal(aborted.length, 0, 'session 删除后不 abort')
+})
+
+// ---- 场景 8: V2 事件名 → V1 形状映射 (翻译层) ----
+test('v2EventToV1: V2 事件名映射到 V1 形状 (含 quiet 标记)', () => {
+  const sid = 'v2-s1'
+  assert.deepEqual(v2EventToV1({ type: 'session.execution.started', data: { sessionID: sid } }), {
+    type: 'session.status',
+    properties: { sessionID: sid, status: { type: 'busy' } },
+  })
+  assert.deepEqual(v2EventToV1({ type: 'session.execution.succeeded', data: { sessionID: sid } }), {
+    type: 'session.idle',
+    properties: { sessionID: sid },
+  })
+  assert.deepEqual(v2EventToV1({ type: 'session.execution.interrupted', data: { sessionID: sid } }), {
+    type: 'session.idle',
+    properties: { sessionID: sid },
+  })
+  assert.deepEqual(v2EventToV1({ type: 'session.tool.called', data: { sessionID: sid, tool: 'bash' } }), {
+    type: 'tool.execute.before',
+    properties: { sessionID: sid, tool: 'bash' },
+  })
+  assert.deepEqual(v2EventToV1({ type: 'session.tool.success', data: { sessionID: sid, tool: 'bash' } }), {
+    type: 'tool.execute.after',
+    properties: { sessionID: sid, tool: 'bash' },
+  })
+
+  const delta = v2EventToV1({ type: 'session.text.delta', data: { sessionID: sid } })
+  assert.equal(delta.type, 'message.part.delta')
+  assert.equal(delta.properties.sessionID, sid)
+  assert.equal(delta.__quiet, true, '逐 token delta 应是 quiet (不刷日志)')
+
+  const stepEnded = v2EventToV1({ type: 'session.step.ended', data: { sessionID: sid } })
+  assert.equal(stepEnded.type, 'message.part.delta')
+  assert.notEqual(stepEnded.__quiet, true, '粗粒度事件仍要写日志')
+
+  // V1 形状原样放行 (V1 版 opencode 直接走这条)
+  const v1Event = { type: 'session.status', properties: { sessionID: sid, status: { type: 'busy' } } }
+  assert.equal(v2EventToV1(v1Event), v1Event)
+
+  // 未知事件不影响状态机, 也不刷日志
+  const unknown = v2EventToV1({ type: 'plugin.added', data: {} })
+  assert.equal(unknown.__quiet, true)
+})
+
+// ---- 场景 9: V2 事件序列端到端驱动状态机 ----
+test('V2 事件序列: execution.started → delta 刷新 → 静默超时 abort', async () => {
+  const { deps, advance, aborted } = fakeDeps({ stallTimeoutMs: 1000 })
+  const wd = createWatchdog(deps)
+
+  await wd.handleEvent(v2EventToV1({ type: 'session.execution.started', data: { sessionID: 'v2' } }))
+  advance(600)
+  await wd.handleEvent(v2EventToV1({ type: 'session.text.delta', data: { sessionID: 'v2' } }))
+  advance(600)
+  assert.equal(aborted.length, 0, 'delta 刷新后 600ms 不应 abort')
+  advance(600)
+  assert.equal(aborted.length, 1, '刷新后静默超时应 abort')
+})
+
+// ---- 场景 10: V2 工具事件映射后仍满足豁免语义 ----
+test('V2 事件序列: tool.called 豁免 → tool.success 恢复计时 → 超时 abort', async () => {
+  const { deps, advance, aborted } = fakeDeps({ stallTimeoutMs: 1000 })
+  const wd = createWatchdog(deps)
+
+  await wd.handleEvent(v2EventToV1({ type: 'session.execution.started', data: { sessionID: 'v2' } }))
+  await wd.handleEvent(v2EventToV1({ type: 'session.tool.called', data: { sessionID: 'v2', tool: 'bash' } }))
+  advance(2000)
+  assert.equal(aborted.length, 0, '工具执行中不应 abort (等第三方返回)')
+
+  await wd.handleEvent(v2EventToV1({ type: 'session.tool.success', data: { sessionID: 'v2', tool: 'bash' } }))
+  await wd.handleEvent(v2EventToV1({ type: 'session.text.delta', data: { sessionID: 'v2' } }))
+  advance(1500)
+  assert.equal(aborted.length, 1, '工具结束恢复计时后静默超时应 abort')
+})
+
+// ---- 场景 11: toolDepth 卡死自愈 (V2 中断导致 success 事件缺失) ----
+test('session.idle 归零 toolDepth → 下一轮静默超时仍能 abort', async () => {
+  const { deps, advance, aborted } = fakeDeps({ stallTimeoutMs: 1000 })
+  const wd = createWatchdog(deps)
+
+  await wd.handleEvent(v2EventToV1({ type: 'session.execution.started', data: { sessionID: 'v2' } }))
+  await wd.handleEvent(v2EventToV1({ type: 'session.tool.called', data: { sessionID: 'v2', tool: 'bash' } }))
+  advance(2000)
+  assert.equal(aborted.length, 0, '工具执行中豁免')
+
+  // 会话被中断 → 收不到 tool.success → 靠 execution.interrupted 归零 toolDepth
+  await wd.handleEvent(v2EventToV1({ type: 'session.execution.interrupted', data: { sessionID: 'v2' } }))
+
+  // 新的一轮: 若无归零, toolDepth 残留会让该会话永久豁免 → 永不 abort
+  await wd.handleEvent(v2EventToV1({ type: 'session.execution.started', data: { sessionID: 'v2' } }))
+  advance(1500)
+  assert.equal(aborted.length, 1, 'toolDepth 归零后静默超时应 abort')
 })

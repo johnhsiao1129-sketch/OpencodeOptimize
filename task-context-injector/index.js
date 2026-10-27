@@ -1,5 +1,5 @@
 /**
- * task-context-injector — OpenCode plugin (v3: messages.transform 版)
+ * task-context-injector — OpenCode plugin (v4: V1 transform + V2 context hook)
  *
  * 目的: 弥补 opencode 子代理上下文隔离 (OPENCODE_PERFORMANCE_GAP.md §三.1)。
  * 当父代理调用 `task` 工具派发子代理时, 向子代理实际收到的 LLM 消息中
@@ -11,19 +11,26 @@
  *   插件工具经 schema 校验产生另一份 args 对象, before-hook 的写入丢失。
  *   实测: INJECTED 日志 promptLen=75->514, 但子代理实际收到 107 字符无注入。
  *
- * 机制 (v3):
- *   hook `experimental.chat.messages.transform` → 直接改 output.messages
- *   (即将发给 LLM 的消息数组)。这是 OMO team-mailbox-injector 使用的
- *   生产验证机制, 对主会话和子代理会话都触发, 修改必然到达模型。
+ * 机制:
+ *   V1: hook `experimental.chat.messages.transform` → 改 output.messages
+ *   V2: hook `ctx.session.hook("context")` → 改 event.messages
+ *   两者都作用于"即将发给 LLM 的消息数组", 修改必然到达模型。
+ *   (V1 机制来自 OMO team-mailbox-injector 的生产验证; V2 侧事件形状见下方注)
  *
  * 注入目标识别 (子代理 vs 主会话):
- *   1) 白名单: tool.execute.after 从 task 工具返回的 <task_metadata>
+ *   1) 一手信号 (仅 V2): `session.created` 事件的 parentID —— 子代理会话必有
+ *      parentID。经 ctx.event.subscribe() 收集, 作为最可靠的判据。
+ *   2) 白名单: tool.execute.after 从 task 工具返回的 <task_metadata>
  *      session_id: ses_... 捕获子代理会话 ID (set)。
- *   2) 内容启发式: OMO 给每个派发任务的 prompt 末尾追加
+ *   3) 内容启发式: OMO 给每个派发任务的 prompt 末尾追加
  *      `<!-- OMO_INTERNAL_INITIATOR -->`, 主会话的该标记则出现在
  *      <system-reminder> 包装内。裸 prompt 含标记 + 不含 system-reminder
  *      → 判定为子代理会话初始化消息。
  *   上述任一命中即注入。注入后记录 injectedSIDs + 消息内 MARKER 防重复。
+ *
+ * 消息形状: V1 是 `{ info: { role }, parts: [...] }`; V2 的 context 事件形状
+ *   未必相同 (可能是 `{ role, content: [...] }`), 故读写都做了形状自适应
+ *   (见 getMessageRole/getMessageParts/pushTextPart), 并保留一次首次形状探针日志。
  *
  * 全局开关: 改 ENABLED = false 即整体禁用 (无需删插件)。
  *
@@ -62,6 +69,8 @@ const INJECTION = `## ⚠️ 派活交接规范 (${MARKER})
 const injectedSIDs = new Set()
 /** tool.execute.after 捕获到的子代理会话 ID 白名单 */
 const knownSubagentSIDs = new Set()
+/** sessionID → parentID (V2: 子代理判定的一手信号) */
+const parentBySession = new Map()
 
 function debugLog(msg) {
   try {
@@ -71,12 +80,39 @@ function debugLog(msg) {
   }
 }
 
-/** oh-my-opencode 官方 TASK_TOOLS 同款 (dist/index.js:104908) */
-const TASK_TOOLS = ['task', 'call_omo_agent']
+/**
+ * oh-my-opencode 官方 TASK_TOOLS (dist/index.js:104908) + V2 原生子代理工具名。
+ * 'subagent' 是本 harness 暴露的派发工具名 (V2 内置 task 工具的别名)。
+ */
+const TASK_TOOLS = ['task', 'call_omo_agent', 'subagent']
+
+// ---- 消息形状自适应 (V1: info.role + parts / V2: role + content 皆可) ----
+function getMessageRole(message) {
+  return message?.info?.role ?? message?.role
+}
+
+function getMessageParts(message) {
+  if (Array.isArray(message?.parts)) return message.parts
+  if (Array.isArray(message?.content)) return message.content
+  return null
+}
+
+/** 往消息里追加一个 text part (parts 或 content, 哪个存在用哪个) */
+function pushTextPart(message, part) {
+  if (Array.isArray(message?.parts)) {
+    message.parts.push(part)
+    return 'parts'
+  }
+  if (Array.isArray(message?.content)) {
+    message.content.push(part)
+    return 'content'
+  }
+  return null
+}
 
 function findLastUserMessageIndex(messages) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.info?.role === 'user') {
+    if (getMessageRole(messages[index]) === 'user') {
       return index
     }
   }
@@ -92,15 +128,162 @@ function partsToText(parts) {
 
 function extractSubagentSessionID(result) {
   // task 工具返回结果中形如: session_id: ses_xxx (见 <task_metadata>)
+  // V2 原生子代理工具返回形如: <subagent sessionID="ses_xxx" ...>
   const text = typeof result === 'string' ? result : ''
-  const match = text.match(/session_id:\s*(ses_[A-Za-z0-9]+)/)
+  const match = text.match(/session_id:\s*(ses_[A-Za-z0-9]+)/) ?? text.match(/sessionID="(ses_[A-Za-z0-9]+)"/)
   return match ? match[1] : null
 }
 
+/**
+ * 核心注入逻辑 (V1/V2 共用)。
+ * @param {object} args
+ * @param {string|undefined} args.sessionID
+ * @param {string|undefined} args.agent
+ * @param {any[]} args.messages   即将发给 LLM 的消息数组 (会被原地修改)
+ * @returns {'injected'|'skipped'|'noop'}
+ */
+function injectIntoContext({ sessionID, agent, messages }) {
+  if (!Array.isArray(messages) || messages.length === 0) return 'noop'
+
+  // 防重复 1: 消息里已含 MARKER (注入内容持久化到会话历史后)
+  const alreadyInjected = messages.some((message) =>
+    (getMessageParts(message) ?? []).some((part) => part?.type === 'text' && part.text?.includes(MARKER))
+  )
+  if (alreadyInjected) return 'skipped'
+  // 防重复 2: 会话 ID 已注入过
+  if (typeof sessionID === 'string' && injectedSIDs.has(sessionID)) return 'skipped'
+
+  const lastUserIndex = findLastUserMessageIndex(messages)
+  if (lastUserIndex === -1) return 'noop'
+  const lastUser = messages[lastUserIndex]
+  const userText = partsToText(getMessageParts(lastUser))
+
+  // 子代理识别 (三条判据任一命中):
+  //  a) 一手信号: session 有 parentID (V2 session.created 事件收集)
+  //  b) 白名单命中 (tool.execute.after 捕获过该会话)
+  //  c) 内容启发式: 裸 prompt 含 OMO_INTERNAL_INITIATOR 且非 system-reminder 包装
+  const hasParent = typeof sessionID === 'string' && parentBySession.has(sessionID)
+  const isKnownSubagent = typeof sessionID === 'string' && knownSubagentSIDs.has(sessionID)
+  const hasOMOInitiator = userText.includes(OMO_INITIATOR) && !userText.includes('<system-reminder')
+  const isSubagentSession = hasParent || isKnownSubagent || hasOMOInitiator
+
+  debugLog(
+    `CONTEXT sid=${sessionID ?? '(none)'} agent=${agent ?? '(none)'} msgCount=${messages.length} ` +
+      `userLen=${userText.length} hasParent=${hasParent} isKnownSubagent=${isKnownSubagent} hasOMOInitiator=${hasOMOInitiator}`
+  )
+
+  if (!ENABLED || !isSubagentSession) return 'skipped'
+
+  // 注入: 追加一个 synthetic text part 到最后一条 user 消息
+  // (synthetic: true 是 opencode 注入消息的标准标记, team-mailbox 同款)
+  const container = pushTextPart(lastUser, { type: 'text', text: `\n\n${INJECTION}`, synthetic: true })
+  if (!container) {
+    debugLog(`INJECT_SKIPPED sid=${sessionID ?? '(none)'} reason=no-parts-or-content-container`)
+    return 'noop'
+  }
+  if (typeof sessionID === 'string') {
+    injectedSIDs.add(sessionID)
+  }
+  debugLog(
+    `INJECTED sid=${sessionID ?? '(none)'} agent=${agent ?? '(none)'} container=${container} ` +
+      `userLen=${userText.length}->${userText.length + INJECTION.length}`
+  )
+  return 'injected'
+}
+
+/**
+ * OpenCode V2 入口 (2.x)。V2 只认 `{ id, setup(ctx) }`; 缺 setup 会被拒载。
+ * 注: V2 会在同一进程内多次调用 setup (实测 46 次, 对应多个会话级实例);
+ *     每个实例都注册自己的 hook + 订阅自己的事件流 —— 前一个实例的订阅
+ *     在其实例失效后会静默停止投递 (实测复用旧订阅会收不到事件)。
+ */
 const plugin = {
   id: 'opencode-task-context-injector',
+
+  setup: async (ctx) => {
+    debugLog('setup() STARTED (v4: context hook + parentID)')
+
+    // 1. 注入 hook: context 事件即"即将发给 LLM 的消息"
+    ctx.session.hook('context', (event) => {
+      try {
+        injectIntoContext({
+          sessionID: event?.sessionID,
+          agent: typeof event?.agent === 'string' ? event.agent : undefined,
+          messages: event?.messages,
+        })
+      } catch (error) {
+        debugLog(`CONTEXT_HOOK_ERROR ${String(error)}`)
+      }
+    })
+    debugLog('setup(): registered session.hook("context")')
+
+    // 2. task 工具返回 → 捕获子代理 session_id (白名单判据)
+    ctx.tool.hook('execute.after', (event) => {
+      try {
+        const tool = event?.tool ?? '(none)'
+        if (!TASK_TOOLS.includes(tool)) return
+        const result = event?.result?.content ?? event?.result
+        const text = typeof result === 'string' ? result : JSON.stringify(result ?? '')
+        const childSID = extractSubagentSessionID(text)
+        if (childSID) {
+          knownSubagentSIDs.add(childSID)
+          debugLog(`V2_AFTER tool=${tool} capturedSubagent=${childSID}`)
+        } else {
+          debugLog(`V2_AFTER tool=${tool} noSessionID (resultLen=${text.length})`)
+        }
+      } catch (error) {
+        debugLog(`TOOL_HOOK_ERROR ${String(error)}`)
+      }
+    })
+    debugLog('setup(): registered tool.hook("execute.after")')
+
+    // 3. 事件订阅: 记录 session.parentID (子代理的一手判据)
+    // 注: V2 会为每个(会话级)实例投递一份事件 (实测重复 5 份, 去重无效),
+    //     但此处只做 map 写入, 重复投递是幂等的, 无害。
+    const dispatch = (event) => {
+      try {
+        const type = event?.type
+        const data = event?.data ?? {}
+        if (type === 'session.created') {
+          const sid = data.sessionID ?? data.info?.id
+          const parentID = data.parentID ?? data.info?.parentID
+          if (typeof sid === 'string' && parentID) {
+            parentBySession.set(sid, parentID)
+            debugLog(`V2_SESSION_CREATED sid=${sid} parentID=${parentID} (subagent)`)
+          }
+        } else if (type === 'session.deleted' || type === 'session.destroyed') {
+          const sid = data.sessionID ?? data.info?.id
+          if (typeof sid === 'string') {
+            parentBySession.delete(sid)
+            knownSubagentSIDs.delete(sid)
+          }
+        }
+      } catch (error) {
+        debugLog(`EVENT_DISPATCH_ERROR ${String(error)}`)
+      }
+    }
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          dispatch(event)
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) debugLog(`SUBSCRIBE_ERROR ${String(error)}`)
+      }
+    })()
+    debugLog('setup(): subscribed to event stream')
+
+    return () => {
+      controller.abort()
+    }
+  },
+
+  /**
+   * OpenCode V1 入口 (旧版 opencode)。V2 不再调用它, 保留只为兼容 V1。
+   */
   server: async () => {
-    debugLog('server() STARTED (v3 messages.transform)')
+    debugLog('server() STARTED (v4 V1 transform path)')
     return {
       'tool.execute.before': async (hookInput, output) => {
         // 仅诊断: v1/v2 已证明 args mutation 对 OMO 插件工具不传播, 此处不再注入
@@ -128,49 +311,13 @@ const plugin = {
         }
       },
       'experimental.chat.messages.transform': async (input, output) => {
-        const messages = output?.messages ?? []
-        if (messages.length === 0) return
-
-        const sid = input?.sessionID ?? (typeof input?.agent === 'string' ? input.agent : '(none)')
-        const agent = typeof input?.agent === 'string' ? input.agent : '(none)'
-
-        // 防重复 1: 消息里已含 MARKER (注入内容持久化到会话历史后)
-        const alreadyInjected = messages.some((message) =>
-          (message?.parts ?? []).some((part) => part?.type === 'text' && part.text?.includes(MARKER))
-        )
-        if (alreadyInjected) return
-        // 防重复 2: 会话 ID 已注入过
-        if (typeof sid === 'string' && injectedSIDs.has(sid)) return
-
-        const lastUserIndex = findLastUserMessageIndex(messages)
-        if (lastUserIndex === -1) return
-        const lastUser = messages[lastUserIndex]
-        const userText = partsToText(lastUser?.parts)
-
-        // 子代理识别:
-        //  a) 白名单命中 (tool.execute.after 捕获过该会话)
-        //  b) 内容启发式: 裸 prompt 含 OMO_INTERNAL_INITIATOR 且非 system-reminder 包装
-        const isKnownSubagent = typeof sid === 'string' && knownSubagentSIDs.has(sid)
-        const hasOMOInitiator = userText.includes(OMO_INITIATOR) && !userText.includes('<system-reminder')
-        const isSubagentSession = isKnownSubagent || hasOMOInitiator
-
-        debugLog(
-          `TRANSFORM sid=${sid} agent=${agent} msgCount=${messages.length} ` +
-          `userLen=${userText.length} isKnownSubagent=${isKnownSubagent} hasOMOInitiator=${hasOMOInitiator}`
-        )
-
-        if (!ENABLED || !isSubagentSession) return
-
-        // 注入: 追加一个 synthetic text part 到最后一条 user 消息
-        // (synthetic: true 是 opencode 注入消息的标准标记, team-mailbox 同款)
-        lastUser.parts.push({ type: 'text', text: `\n\n${INJECTION}`, synthetic: true })
-        if (typeof sid === 'string') {
-          injectedSIDs.add(sid)
-        }
-        debugLog(`INJECTED_TRANSFORM sid=${sid} agent=${agent} userLen=${userText.length}->${userText.length + INJECTION.length}`)
+        const sid = input?.sessionID ?? (typeof input?.agent === 'string' ? input.agent : undefined)
+        const agent = typeof input?.agent === 'string' ? input.agent : undefined
+        injectIntoContext({ sessionID: sid, agent, messages: output?.messages })
       },
     }
   },
 }
 
 export default plugin
+export { injectIntoContext, extractSubagentSessionID }

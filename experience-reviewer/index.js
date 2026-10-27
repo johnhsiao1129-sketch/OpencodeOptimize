@@ -18,10 +18,14 @@
  * 保留项目级 4 项提醒 (与提取流程正交):
  *   ctx.session.hook('context', cb) → ensureOverviewReminder / ensureSuggestGlobalReminder
  *   / ensureRecycleReminder / ensureGlobalRuleSync (向主 agent 注入合成 part, 不动主流程)
+ *   每次注入提醒后, appendSyntheticText 再补一条「回归主线」锚点 (用户原话 + 做完回原任务),
+ *   避免模型被提醒带偏 / 做完系统子任务就停在原地。
  *
  * 配置 (环境变量, 全可选):
  *   EXP_REVIEW_MAX_MD_BYTES     AGENTS.md 上限 (默认 20KB)
- *   EXP_SIMPLE_MAX_CHARS        simple 单条上限 (默认 50, 兜底防 LLM 百字长句冒充)
+ *   EXP_SIMPLE_MAX_WORDS        simple 单条上限, 单位=词 (默认 35, 兜底防 LLM 百字长句冒充)
+ *                                词数 = 汉字数 + 英文单词数 (一个标识符算一词)
+ *                                另配 120 字符硬顶, 防无空格长串绕过词数口径
  *   EXP_REVIEW_ENABLED          关闭插件 (默认 true)
  *   EXP_OPENCODE_DB_PATH        opencode.db 路径 (默认 ~/.local/share/opencode/opencode.db)
  *
@@ -34,7 +38,7 @@
  *
  * 历史遗留 (保留 exports, v5 不再调用, 但 OCM 复杂经验路径测试与代码原样保留):
  *   storeComplexExperience, queryExperiences → OCM HTTP API (complex → DB)
- *   v5 只处理 simple (≤50 字单句, 写 AGENTS.md)
+ *   v5 只处理 simple (≤35 词单句, 写 AGENTS.md)
  */
 import {
   readFileSync,
@@ -71,13 +75,23 @@ const ENABLED =
   String(process.env.EXP_REVIEW_ENABLED ?? 'true').trim().toLowerCase() !== 'false'
 const MARKER = '[experience-reviewer]'
 const DEBUG_LOG = join(homedir(), 'AppData', 'Local', 'Temp', 'experience-reviewer.log')
+/** 回归主线锚点: 提醒后补一句"做完系统任务回到用户原任务" */
+const MAINLINE_MARKER = '【回归主线】'
+/** 锚点里引用的用户原话最大字数 (超出截断, 防 prompt 膨胀) */
+const MAINLINE_MAX_LEN = 300
 
 const DEFAULT_MAX_MD_BYTES = 20 * 1024 // AGENTS.md 上限 (≈400-600 条一句话规则)
 const envMax = Number(process.env.EXP_REVIEW_MAX_MD_BYTES)
 const MAX_MD_BYTES = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_MD_BYTES
-const envSimpleMax = Number(process.env.EXP_SIMPLE_MAX_CHARS)
-const SIMPLE_MAX_CHARS =
-  Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 50
+const envSimpleMax = Number(process.env.EXP_SIMPLE_MAX_WORDS)
+const SIMPLE_MAX_WORDS =
+  Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 35
+/**
+ * 字符硬顶: 词数口径只数"有几个词", 对无空格长串 (base64/长标识符/整段代码)
+ * 会算成 1 个词而放行。374 条真实样本实测最长英文 token 仅 25 字符、
+ * 词数<=35 的通过项最长 113 字符, 故 120 字符硬顶在真实数据上零损失。
+ */
+const SIMPLE_MAX_CHARS_HARD = 120
 /** cursor 文件: 每项目 .experience-reviewer/experience-cursor.json */
 const CURSOR_FILE = join('.experience-reviewer', 'experience-cursor.json')
 
@@ -100,6 +114,30 @@ function openCodeDbPath() {
 /** OCM 项目标识: sha256(项目根路径)[:16] */
 function projectIdFromCwd(cwd) {
   return createHash('sha256').update(cwd).digest('hex').slice(0, 16)
+}
+
+/**
+ * 条目长度度量, 单位 = "词": 汉字按字算 + 英文按单词算 (一个标识符算一词)。
+ *
+ * ⚠️ 为什么不用 text.length (v5.2 修复):
+ *   提示词写"≤50 字"时, 模型按**汉字数**理解 (中文语境下"50 字"= 50 个汉字),
+ *   而代码 text.length 把每个英文字母/标点/空格各算 1 → 口径不一致, 规则不可执行。
+ *   实测: 模型认为达标的条目 (汉字仅 24~30) 被代码判成 58~81 字符 → 静默丢弃。
+ *   历史 299 条提取里 117 条 (39%) 这么被丢, 63 个有提取的批次里 15 个全军覆没。
+ *   改用"词数"后, 提示词与代码同一把尺子, 模型可自行估算 (汉字数 + 英文词数)。
+ *
+ * 门槛 35 词的依据 (374 条真实历史条目实测, 配 120 字符硬顶):
+ *   门槛 30 → 丢弃 13.2% (纯中文条目丢 20.2%, 误伤明显)
+ *   门槛 35 → 丢弃  3.4% (纯中文条目丢  3.6%, 通过项 max token 41.2)
+ *   门槛 38 → 丢弃  2.1% (纯中文条目丢  1.2%, 通过项 max token 43.1)
+ *   取 35: 丢弃率比旧口径 (32.4%) 低一个数量级, token 预算与现状 (max 39.6) 持平。
+ */
+function wordCount(text) {
+  if (typeof text !== 'string' || !text) return 0
+  const cjk = text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g)
+  // 连字符算标识符内部 (experience-reviewer = 1 词), 与"一个标识符算一词"一致
+  const en = text.match(/[A-Za-z][A-Za-z0-9_-]*/g)
+  return (cjk ? cjk.length : 0) + (en ? en.length : 0)
 }
 
 function debugLog(msg) {
@@ -129,10 +167,46 @@ function messagePartsOf(message) {
   return null
 }
 
+/**
+ * 往消息尾部追加一段注入文本 (synthetic=true = 插件注入, 非用户原话)。
+ *
+ * 追加提醒后, 再追加一条"回归主线"锚点:
+ *   提醒(清理多余规则 / 逐条询问升级全局 / 补项目概述)是插件插进来的系统子任务,
+ *   落在用户原话之后 → 模型读到的是"系统任务", 做完就停在系统任务上、忘了原任务。
+ *   锚点把用户原话重新点一次, 明确"这是附带项, 做完回原任务"。
+ *
+ * 锚点用 mainline:true 标记 (不用文本匹配, 避免误删用户自己写的同名字符串);
+ * 追加新提醒前先摘掉旧锚点 → 多条提醒时锚点始终在最后一条、且不重复。
+ */
 function appendSyntheticText(message, text) {
   const parts = messagePartsOf(message)
   if (!parts) return false
+  // 用户原话 = 该消息里非 synthetic 的文本 (插件注入的都带 synthetic)
+  const real = parts
+    .filter((p) => p?.type === 'text' && !p?.synthetic)
+    .map((p) => p?.text || '')
+    .join('\n')
+    .trim()
+  // 摘掉旧锚点 (保证锚点永远在最后)
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    if (parts[i]?.mainline === true) parts.splice(i, 1)
+  }
   parts.push({ type: 'text', text, synthetic: true })
+  if (real) {
+    const cut = real.slice(0, MAINLINE_MAX_LEN)
+    const tail = real.length > MAINLINE_MAX_LEN ? '……（完整原文见本消息上文）' : ''
+    parts.push({
+      type: 'text',
+      synthetic: true,
+      mainline: true,
+      text:
+        `${MAINLINE_MARKER}上面这条系统任务是插进来的附带项，不要把它当成本轮的新任务。` +
+        `它处理完（包括需要我确认的部分）之后，请回到用户原本任务继续；` +
+        `原本任务若已完成或无需再做，直接汇报收尾即可，不要因此重新开工或额外展开。\n` +
+        `用户原本任务：${cut}${tail}`,
+    })
+    debugLog(`MAINLINE_ANCHOR injected realLen=${real.length} quotedLen=${cut.length}`)
+  }
   return true
 }
 
@@ -191,19 +265,40 @@ function recycleTargetCount() {
   return Math.max(1, Math.floor(RECYCLE_THRESHOLD * RECYCLE_TARGET_RATIO))
 }
 
-/** 从 subagent / compact stdout 提取 JSON 块 (容错: 可能带前后缀/代码块) */
+/**
+ * 从 subagent / compact stdout 提取 JSON 块 (容错: 可能带前后缀/代码块)。
+ *
+ * ⚠️ v5 起输入是 compact 摘要全文, 摘要正文可能提到 "```json" 字面量
+ *    (如用户需求里写 "末尾附 ```json 块") → 首个 ``` 匹配会从正文那个字面量
+ *    一路吞到真正 JSON 块的结束围栏, 切出的 { } 中段是散文, JSON.parse 抛错
+ *    被静默吞掉 → 整批经验丢失 (实测 v5 时代 66 次压缩丢 13 批)。
+ *    修法: 保留"首个匹配"为首选 (行为不变), 失败再依次试"最后一个 ```json 块"。
+ *    798 个历史摘要实测: 现状可解的批次结果零变化, 额外救回 14 批 85 条。
+ */
 function extractJsonBlock(text) {
   if (typeof text !== 'string' || !text.trim()) return null
   const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/)
-  const candidate = codeBlock ? codeBlock[1] : text
-  const start = candidate.indexOf('{')
-  const end = candidate.lastIndexOf('}')
-  if (start === -1 || end === -1 || end <= start) return null
-  try {
-    return JSON.parse(candidate.slice(start, end + 1))
-  } catch {
-    return null
+  const candidates = []
+  if (codeBlock) candidates.push(codeBlock[1])
+  else candidates.push(text)
+  // 回退候选: 所有 ```json 块, 从后往前试 (正文里的字面量在前, 真 JSON 块在后)
+  const marks = [...text.matchAll(/```json/g)].map((m) => m.index)
+  for (let k = marks.length - 1; k >= 0; k -= 1) {
+    const start = marks[k]
+    const close = text.indexOf('```', start + 7)
+    candidates.push(close === -1 ? text.slice(start + 7) : text.slice(start + 7, close))
   }
+  for (const candidate of candidates) {
+    const s = candidate.indexOf('{')
+    const e = candidate.lastIndexOf('}')
+    if (s === -1 || e === -1 || e <= s) continue
+    try {
+      return JSON.parse(candidate.slice(s, e + 1))
+    } catch {
+      /* 试下一个候选 */
+    }
+  }
+  return null
 }
 
 /** v5 解析: compact 文本里抽 simple + usedEntries (complex v5 不产出) */
@@ -251,7 +346,7 @@ function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
     '{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"usedEntries":["..."]}\n' +
     '\n' +
     '规则：\n' +
-    '1. simple: 单条 ≤50 字单句；scope 一律 project；只能沉淀「未来还会被反复应用的规则/偏好/教训」\n' +
+    '1. simple: 单条 ≤35 词单句（中文按字算，英文按单词算，一个标识符算一词）；scope 一律 project；只能沉淀「未来还会被反复应用的规则/偏好/教训」\n' +
     '2. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
     '3. 排除（绝不输出）：可从代码/文档推导、一次性任务安排、特定 skill 专属规则、已存过/高度相似、已交付产物的写法/格式、行业公开知识\n' +
     '4. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
@@ -495,8 +590,12 @@ function createExperienceReviewer(deps) {
     for (const e of entries) {
       const text = e?.text
       if (!text) continue
-      if (text.length > SIMPLE_MAX_CHARS) {
-        log(`MD_TOO_LONG chars=${text.length} max=${SIMPLE_MAX_CHARS} skipped="${text.slice(0, 30)}…"`)
+      const words = wordCount(text)
+      if (words > SIMPLE_MAX_WORDS || text.length > SIMPLE_MAX_CHARS_HARD) {
+        log(
+          `MD_TOO_LONG words=${words} max=${SIMPLE_MAX_WORDS} chars=${text.length} ` +
+            `maxChars=${SIMPLE_MAX_CHARS_HARD} skipped="${text.slice(0, 30)}…"`
+        )
         continue
       }
       if (existing.includes(text) || added.includes(text)) continue // 去重 (原文)
@@ -713,7 +812,7 @@ const plugin = {
   id: 'opencode-experience-reviewer',
   setup: async (ctx) => {
     debugLog(
-      `setup() STARTED ${MARKER} v5(compact-hook) maxMdBytes=${MAX_MD_BYTES} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5.2(compact-hook+jsonfix+wordcap) maxMdBytes=${MAX_MD_BYTES} enabled=${ENABLED}`
     )
     if (!ENABLED) {
       debugLog('setup() DISABLED (ENABLED=false)')
@@ -860,4 +959,5 @@ export {
   stripEntryStamp,
   stampEntryLine,
   normalizeProjectDir,
+  wordCount,
 }
