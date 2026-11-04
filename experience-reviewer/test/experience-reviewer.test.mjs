@@ -32,6 +32,10 @@ import {
   stripEntryStamp,
   stampEntryLine,
   wordCount,
+  bigrams,
+  isNearDuplicate,
+  hasUserSignal,
+  looksLikeCode,
 } from '../index.js'
 
 /** 内存 fs mock: cursor / AGENTS.md 全在 Map 里, 零真实写盘 */
@@ -342,6 +346,21 @@ test('countMdEntries: 仅计 `- ` 开头的一行条目', () => {
   assert.equal(countMdEntries('  - 缩进不是条目'), 1) // 缩进 list 项也算 (markdown 嵌套)
 })
 
+test('countMdEntries: 排除外部注入块 (别的插件写的条目不计入)', () => {
+  // 外部注入块里的 `- ` 行不是本项目自己的规范, 计进来会让回收提醒被外部内容提前触发
+  const md = [
+    '- [2026-10-13] 自有条目 1',
+    '- [2026-10-13] 自有条目 2',
+    '<!-- XXX:START (scope=project) -->',
+    '- **外部经验 A** id=aaa',
+    '  使用时机: xxx',
+    '- **外部经验 B** id=bbb',
+    '<!-- XXX:END -->',
+    '- [2026-10-13] 自有条目 3',
+  ].join('\n')
+  assert.equal(countMdEntries(md), 3) // 只有自有 3 条, 外部 2 条不计
+})
+
 test('dateStamp: YYYY-MM-DD 本地时区', () => {
   assert.equal(dateStamp(Date.UTC(2026, 0, 5)), '2026-01-05')
   assert.equal(dateStamp(Date.UTC(2026, 9, 13)), '2026-10-13')
@@ -385,14 +404,14 @@ test('extractionInstructionForCompact: 返回 user role + 含 JSON schema 的 te
   assert.match(text, /"simple"/)
   assert.match(text, /"usedEntries"/)
   assert.match(text, /我的项目/)
-  assert.match(text, /现有条目数[：:]\s*12/)
+  assert.match(text, /现有自有条目数[：:]\s*12/)
   assert.equal(msg.content[0].synthetic, true)
 })
 
 test('extractionInstructionForCompact: 空 overview/entryCount → fallback 文本', () => {
   const msg = extractionInstructionForCompact('', 0)
   assert.match(msg.content[0].text, /项目概述[：:]\s*\(无\)/)
-  assert.match(msg.content[0].text, /现有条目数[：:]\s*0/)
+  assert.match(msg.content[0].text, /现有自有条目数[：:]\s*0/)
 })
 
 // ── v5 handleCompactionEnded ──
@@ -514,7 +533,7 @@ test('buildCompactionInjection: 返回 user role 注入消息 (含项目上下�
   assert.ok(inj)
   assert.equal(inj.role, 'user')
   assert.match(inj.content[0].text, /我的项目/)
-  assert.match(inj.content[0].text, /现有条目数[：:]\s*2/)
+  assert.match(inj.content[0].text, /现有自有条目数[：:]\s*2/)
 })
 
 test('buildCompactionInjection: 项目禁用 → null', () => {
@@ -618,6 +637,41 @@ test('ensureRecycleReminder: 条目数 < 100 → 不注入', () => {
   const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
   r.ensureRecycleReminder({ messages: [msg] })
   assert.equal(msg.content.length, 1)
+})
+
+test('ensureRecycleReminder: 清理标准与写入侧四类口径对齐 + 保护外部注入块', () => {
+  const lines = []
+  for (let i = 1; i <= 105; i++) lines.push(`- [2026-10-13] 规则 ${i}`)
+  const { deps } = makeDeps({ tag: 'recycle-align', content: lines.join('\n') })
+  const r = createExperienceReviewer(deps)
+  const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
+  r.ensureRecycleReminder({ messages: [msg] })
+  const text = msg.content[1].text
+  // 清理标准 = 写入侧同一把尺子 (Claude 四类)
+  for (const k of ['user', 'feedback', 'project', 'reference']) {
+    assert.match(text, new RegExp(k))
+  }
+  assert.match(text, /四类都不沾 → 删/)
+  assert.match(text, /重复同义/)
+  assert.match(text, /措辞不同也算同义/)
+  // 外部注入块保护
+  assert.match(text, /不要动 <!-- XXX:START\/END --> 这类外部注入块/)
+})
+
+test('ensureRecycleReminder: 外部注入块的条目不计入阈值 (不会被外部内容提前触发)', () => {
+  const lines = []
+  for (let i = 1; i <= 95; i++) lines.push(`- [2026-10-13] 自有规则 ${i}`)
+  const md = [
+    ...lines,
+    '<!-- XXX:START (scope=project) -->',
+    ...Array.from({ length: 40 }, (_, i) => `- **外部经验 ${i}** id=x${i}`),
+    '<!-- XXX:END -->',
+  ].join('\n')
+  const { deps } = makeDeps({ tag: 'recycle-ext', content: md })
+  const r = createExperienceReviewer(deps)
+  const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
+  r.ensureRecycleReminder({ messages: [msg] })
+  assert.equal(msg.content.length, 1) // 自有 95 条 < 100 → 不注入
 })
 
 // ── 回归主线锚点 (提醒后补原任务) ──
@@ -823,4 +877,128 @@ test('queryExperiences: 失败 → success=false + 空数组', async () => {
   const out = await queryExperiences({ fetchImpl: fakeFetch })
   assert.equal(out.success, false)
   assert.deepEqual(out.experiences, [])
+})
+
+// ── 准入门槛 (v5.3 admission-gate) ─────────────────────────────────────────
+// 背景: 历史上 135 个压缩批次产出 676 条, 平均每批 5 条 → AGENTS.md 膨胀主因。
+// 门槛 = 长度护栏 → 纯代码兜底 → 近重复 → 用户信号优先排序 → 每批条数上限。
+
+test('bigrams: 去空格与中英文标点, 只留实词 2-gram', () => {
+  assert.deepEqual([...bigrams('规则 A')], ['规则', '则A'])
+  assert.deepEqual([...bigrams('a')], ['a'])
+  assert.equal(bigrams('').size, 0)
+})
+
+test('isNearDuplicate: 同义改写判为近重复, 无关条目不判', () => {
+  // 真实存量里的一对 (Jaccard=0.67): 字面不同但说的是同一件事
+  const a = 'lazy import 的 `_impl_path` 必须调用 `.resolve()` 转绝对路径，cwd 变化时解析出错'
+  const b = 'lazy import 的 `_impl_path` 必须 `.resolve()` 转绝对路径，否则 cwd 变化时解析出错'
+  assert.equal(isNearDuplicate(b, [bigrams(a)]), true)
+  assert.equal(isNearDuplicate('完全不相干的一条规则：发布单与 CSV 要整体重写', [bigrams(a)]), false)
+})
+
+test('hasUserSignal: 识别用户明确表达, 普通事实句不算', () => {
+  assert.equal(hasUserSignal('用户明确要求改代码前先报备拍板'), true)
+  assert.equal(hasUserSignal('必须先备份再改 AGENTS.md'), true)
+  assert.equal(hasUserSignal('状态栏上下文口径按单次请求实测计算'), false)
+})
+
+test('looksLikeCode: 只判"整条就是代码", 含文档路径的普通句子不算', () => {
+  assert.equal(looksLikeCode('def process_batch(items):\n    return [x for x in items]'), true)
+  assert.equal(looksLikeCode('const a = 1'), true)
+  // 关键回归: 早期用路径/标识符启发式会误杀这一类 (含 AGENTS.md 但其实是用户偏好)
+  assert.equal(looksLikeCode('AGENTS.md 出现 [建议全局] 前缀时, 当面向用户确认是否转全局'), false)
+  assert.equal(looksLikeCode('改提示词要极简, 一句能说清绝不用一篇'), false)
+})
+
+test('writeSimpleEntries: 每批上限 2 条 → 第 3 条起被拒 (MD_BATCH_CAP)', () => {
+  const { collector, deps, mem } = makeDeps({ tag: 'write-batch-cap' })
+  const r = createExperienceReviewer(deps)
+  r.writeSimpleEntries([
+    { scope: 'project', suggestGlobal: false, text: '条目甲' },
+    { scope: 'project', suggestGlobal: false, text: '条目乙' },
+    { scope: 'project', suggestGlobal: false, text: '条目丙' },
+    { scope: 'project', suggestGlobal: false, text: '条目丁' },
+  ])
+  const md = mem.read(join(deps.directory, 'AGENTS.md'))
+  assert.match(md, /条目甲/)
+  assert.match(md, /条目乙/)
+  assert.doesNotMatch(md, /条目丙/)
+  assert.doesNotMatch(md, /条目丁/)
+  assert.match(collector.lines.join('\n'), /MD_BATCH_CAP cap=2/)
+})
+
+test('writeSimpleEntries: 近重复拦截同义改写 (字面去重拦不住的那种)', () => {
+  const { collector, deps, mem } = makeDeps({
+    tag: 'write-near-dup',
+    content: '- [2026-01-01] lazy import 的 `_impl_path` 必须调用 `.resolve()` 转绝对路径，cwd 变化时解析出错',
+  })
+  const r = createExperienceReviewer(deps)
+  r.writeSimpleEntries([
+    { scope: 'project', suggestGlobal: false, text: 'lazy import 的 `_impl_path` 必须 `.resolve()` 转绝对路径，否则 cwd 变化时解析出错' },
+  ])
+  const md = mem.read(join(deps.directory, 'AGENTS.md'))
+  assert.doesNotMatch(md, /否则 cwd 变化时解析出错/)
+  assert.match(collector.lines.join('\n'), /MD_NEAR_DUP/)
+})
+
+test('writeSimpleEntries: 纯代码条目被拒 (MD_CODE_SKIP)', () => {
+  const { collector, deps, mem } = makeDeps({ tag: 'write-code-skip' })
+  const r = createExperienceReviewer(deps)
+  r.writeSimpleEntries([
+    { scope: 'project', suggestGlobal: false, text: 'def process_batch(items):\n    return [x for x in items]' },
+  ])
+  assert.equal(mem.read(join(deps.directory, 'AGENTS.md')), '')
+  assert.match(collector.lines.join('\n'), /MD_CODE_SKIP/)
+})
+
+test('writeSimpleEntries: 用户信号优先 → 同额度下留有用户明确表达的条目', () => {
+  const { deps, mem } = makeDeps({ tag: 'write-user-priority' })
+  const r = createExperienceReviewer(deps)
+  r.writeSimpleEntries([
+    { scope: 'project', suggestGlobal: false, text: '状态栏上下文口径按单次请求实测计算' },
+    { scope: 'project', suggestGlobal: false, text: '缓存命中率从 usage.tokens.cache.read 取' },
+    { scope: 'project', suggestGlobal: false, text: '用户明确要求改代码前先报备拍板' },
+    { scope: 'project', suggestGlobal: false, text: '日志按天切分存放便于排查' },
+  ])
+  const md = mem.read(join(deps.directory, 'AGENTS.md'))
+  assert.match(md, /用户明确要求改代码前先报备拍板/) // 有用户信号 → 必留
+  assert.match(md, /状态栏上下文口径按单次请求实测计算/) // 无信号但排第 2 → 也留
+  assert.doesNotMatch(md, /缓存命中率从 usage.tokens.cache.read 取/)
+  assert.doesNotMatch(md, /日志按天切分存放便于排查/)
+})
+
+test('writeSimpleEntries: MD_FULL 拒绝的条目不占每批额度 (额度留给能写的)', () => {
+  const { collector, deps, mem } = makeDeps({ tag: 'write-cap-nocount' })
+  // maxMdBytes=45: 第 1 条写入后占 22 字节; 第 2 条过长 (29+22>45) 被 MD_FULL 拒;
+  // 第 3 条 (21+22=43<=45) 仍能写 → 证明被拒的条目没有吃掉每批额度
+  const r = createExperienceReviewer({ ...deps, maxMdBytes: 45 })
+  r.writeSimpleEntries([
+    { scope: 'project', suggestGlobal: false, text: '短条目 1' },
+    { scope: 'project', suggestGlobal: false, text: '短条目 2 填充字符超出上限' },
+    { scope: 'project', suggestGlobal: false, text: '末尾条目 3' },
+  ])
+  const md = mem.read(join(deps.directory, 'AGENTS.md'))
+  assert.match(md, /短条目 1/)
+  assert.match(md, /末尾条目 3/) // 第 2 条被 MD_FULL 拒, 不吃掉额度
+  assert.doesNotMatch(md, /短条目 2/)
+  assert.match(collector.lines.join('\n'), /MD_FULL/)
+})
+
+test('extractionInstructionForCompact: 含 Claude 四类口径 + 硬排除 + 每批上限', () => {
+  const { text } = extractionInstructionForCompact('我的项目', 3).content[0]
+  // Claude auto memory 四类
+  assert.match(text, /user\s+用户的角色/)
+  assert.match(text, /feedback\s+用户的纠正与确认/)
+  assert.match(text, /project\s+从代码推导不出的项目决策/)
+  assert.match(text, /reference\s+项目外部资源的位置/)
+  // 硬排除清单
+  assert.match(text, /能从代码\/仓库\/文档推导出来的/)
+  assert.match(text, /行业公开知识/)
+  // 宁缺毋滥 + 动态告知上限
+  assert.match(text, /最多输出 2 条/)
+  assert.match(text, /不要凑数/)
+  // 旧口径不许复活
+  assert.match(text, /≤35 词/)
+  assert.doesNotMatch(text, /≤50 字/)
 })

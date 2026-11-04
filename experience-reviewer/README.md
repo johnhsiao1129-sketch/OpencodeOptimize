@@ -1,4 +1,4 @@
-# experience-reviewer — OpenCode 会话经验回顾插件 (mission 161, v2.7)
+# experience-reviewer — OpenCode 会话经验回顾插件 (mission 161, v5.4)
 
 ## 解决什么问题
 对话中产生的**可复用经验**（一句话规则 / 多行使用规范）随会话结束而丢失。
@@ -8,6 +8,66 @@
   由主 agent 当面向用户确认后迁全局，不再由 subagent 直写全局）
 - **复杂经验**（需要多行才能说明白的可复用知识/流程）→ 经 **OCM HTTP API** 写入 OCM 经验库
   （API 未就绪时留 stub，仅记 `EXP_COMPLEX_API_NOT_READY` 日志，不推进 cursor 以便重试）
+
+## 准入门槛（v5.3，2026-11-05）
+
+### 为什么要有这一节
+**恶性循环**：规范越存越多 → 每轮对话注入的 system prompt 越来越长 → token 消耗加速 →
+压缩更频繁 → 每次压缩又产出好几条新规范 → 规范继续膨胀。
+
+实测（676 条真实历史提取，135 个压缩批次）：
+
+| 口径 | 保留条数 | token | 相对现行 |
+|---|---|---|---|
+| 现行（仅长度护栏） | 609 | ~17.3k | — |
+| + 每批 ≤2 条 | 259 | ~7.7k | **-55.4%** |
+| + 每批 ≤1 条 | 133 | ~4.0k | **-76.9%** |
+
+**每批条数上限是最强杠杆** —— 膨胀主因不是"单条太长"，而是"条数太多"
+（历史上平均每批产 5 条，最多的一批 13 条）。
+
+### 口径来源：Claude Code auto memory
+官方分类法（<https://code.claude.com/docs/en/memory>）只存四类：
+`user`（用户角色/偏好）、`feedback`（用户纠正与确认）、`project`（从代码推导不出的决策）、
+`reference`（外部资源位置）；并**硬排除**「能从代码/仓库推导出来的」与「CLAUDE.md 已有的」；
+总判据是「这条信息在未来的对话里还用得上吗」；`MEMORY.md` 上限 200 行 / 25KB，写满即报错要求重写索引。
+
+本插件的提示词已改成同一套口径（规则 2 列四类、规则 3 列硬排除、规则 4 宁缺毋滥 + 动态告知上限）。
+
+### 门槛执行链（`writeSimpleEntries`，按顺序）
+1. **长度护栏** — ≤35 词（汉字按字、英文按单词、一个标识符算一词）且 ≤120 字符。
+2. **纯代码兜底** — 整条就是一段代码 → 拒（`MD_CODE_SKIP`）。
+   ⚠️ 刻意做得极窄：中文语境下用"文件路径 / snake_case 标识符 / module.attr"启发式会大面积误伤——
+   实测连 `AGENTS.md` 这种文档路径都能命中，把「用户明确不迁全局也不留项」这种**用户偏好**也误杀了（66 条）。
+   所以"能否从代码推导"交给**提示词侧**（模型判），插件侧不猜。
+3. **近重复检测** — 2-gram Jaccard ≥ 0.55 与已有 AGENTS.md 条目 / 本批已选条目重复 → 拒（`MD_NEAR_DUP`）。
+   字面去重（`existing.includes(text)`）拦不住同义改写：实测 335 条存量里检出 13 对近重复，其中 1 对 Jaccard=1.00。
+4. **用户信号优先** — 带用户明确表达（用户/明确/偏好/禁止/要求…）的条目排前面。
+   ⚠️ **只排序、不硬排**：硬排会误杀「V2 plugin ctx 拿项目目录用 ctx.directory」这类高价值通用技术坑
+   （它们没有用户字样但值得沉淀）。排序后同样额度下留下的条目明显更好，又不丢条目。
+5. **每批条数上限** — 最多写 `EXP_SIMPLE_MAX_PER_BATCH` 条（默认 **2**），超出的记 `MD_BATCH_CAP`。
+   被 `MD_FULL`（AGENTS.md 满）拒绝的条目**不占额度**。
+
+## 注入点清单（v5.4，2026-11-05）
+
+插件一共 **4 处**向模型注入文本，准入口径必须四处一致，否则会出现"写得严、清得松"或反之。
+
+| # | 注入点 | 触发时机 | 与准入门槛的关系 | v5.4 状态 |
+|---|---|---|---|---|
+| 1 | `extractionInstructionForCompact` | 压缩前，把提取指令追加到 compact prompt 末尾 | **写入侧主闸门**：四类口径 + 硬排除 + 每次最多 N 条 | ✅ v5.3 已同步 |
+| 2 | `ensureRecycleReminder` | 自有条目数 ≥100 时（每轮 user turn） | **清理侧闸门**：清理标准必须与写入侧同一把尺子 | ✅ v5.4 已对齐四类口径 + 补"重复同义按语义判" + 保护外部注入块 |
+| 3 | `ensureOverviewReminder` | 项目 AGENTS.md 缺 `> **项目概述**: ` 首行 | 与门槛无关（补项目自述） | ✅ 无需改 |
+| 4 | `ensureSuggestGlobalReminder` | 出现 `[建议全局] ` 前缀条目时 | 与门槛无关（问用户是否迁全局） | ✅ 无需改 |
+
+另有 `appendSyntheticText` 追加的「回归主线」锚点（每条提醒后一条）——纯防跑偏，不涉及门槛。
+
+### ⚠️ 外部注入块不计入条目数（v5.4 修复）
+`countMdEntries` 原来统计 AGENTS.md 里**所有** `- ` 开头的行，包括别的插件写入的
+`<!-- XXX:START -->` .. `<!-- XXX:END -->` 注入块。两个后果：
+1. **阈值判断失真** —— 实测某项目自有条目 11 条、外部块 39 条，计数却是 50；
+2. **回收提醒可能让模型删掉外部块里的行** —— 那块标注了不可手改。
+
+现在计数排除外部注入块，清理提醒也明确写了「只处理本项目自己写的条目，不要动外部注入块」。
 
 ## v2.0 架构（subagent 模式，主 agent 零中断）
 v1.0 用 `messages.transform` 直接向主会话注入回顾指令——验证可行，但会打断主 agent 节奏。
@@ -161,6 +221,8 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
 | `EXP_REVIEW_ROUND_INTERVAL`（环境变量） | 3（轮） | 轮次触发阈值 |
 | `EXP_REVIEW_TIME_INTERVAL_MS`（环境变量） | 600000（10 分钟） | 时间触发阈值 |
 | `EXP_REVIEW_MAX_MD_BYTES`（环境变量） | 20480（20KB） | AGENTS.md 上限，超限跳过+告警 |
+| `EXP_SIMPLE_MAX_WORDS`（环境变量） | 35 | simple 单条词数上限（汉字按字 + 英文按单词，一个标识符算一词） |
+| `EXP_SIMPLE_MAX_PER_BATCH`（环境变量） | **2** | **每次压缩最多沉淀几条**（收紧准入门槛的主杠杆；设 1 更狠；0 视为非法值回落默认） |
 | `EXP_REVIEW_MODEL`（环境变量） | `opencode/big-pickle` | subagent 模型（`opencode run -m <model>`）。⚠️ 勿清空：无 `-m` 时 opencode 默认解析会选中不可用的 `nvidia/moonshotai/kimi-k3` 导致 subagent 挂起 |
 | `EXP_REVIEW_MAX_MESSAGES`（环境变量） | 200 | SQL 防御上限；cursor 之后**全部**新内容都应提取，超出部分按完整轮次截断 |
 | `EXP_REVIEW_TIMEOUT_MS`（环境变量） | 120000（2 分钟） | subagent 超时 |
@@ -175,6 +237,8 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
 （项目概述检测/注入）、`EXP_COMPLEX_API_NOT_READY`（OCM API stub）、
 `MD_STAMP_REFRESH updated=N`（时间戳刷新命中数）、`MD_STAMP_REFRESH_SKIP`（超限跳过刷新，v2.7）、
 `REVIEW_DONE`（cursor 已更新）、`MD_FULL`（超限跳过）。
+v5.3 新增：`MD_BATCH_CAP cap=N`（超每批条数上限被拒）、`MD_NEAR_DUP`（近重复被拒）、
+`MD_CODE_SKIP`（纯代码条目被拒）、`MD_TOO_LONG`（超长度护栏被拒）。
 
 ## 验证方法
 1. **已加载**：重启 opencode 后 `%TEMP%\experience-reviewer.log` 首行 `server() STARTED [experience-reviewer]`
@@ -185,7 +249,7 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
    （v2.5 persistent：每次 user-turn transform 都注入，不再 one-shot；补写后下轮 `OVERVIEW_OK hasOverview=true` 永久停）
 5. **复杂经验**：OCM API 就绪后，log 出现 `COMPLEX_STORED`；未就绪则 `EXP_COMPLEX_API_NOT_READY`
    （且 cursor 不推进，下次重试）
-6. **单元测试**：`node --test test/experience-reviewer.test.mjs` 80/80
+6. **单元测试**：`node --test test/experience-reviewer.test.mjs` 72/72；`bun test test/bun-smoke.test.mjs` 5/5
 
 ## 待办（OCM API 协商中）
 - [ ] OCM 侧提供 `POST /experience`（写经验）与 `GET /experience`（查经验，project+global，去重用）
@@ -223,4 +287,18 @@ system prompt：50KB = 每轮固定吃掉 1.5万-2.5万 token 上下文，8k 上
   ③ `refreshUsageStamps` 按 `usedEntries` 刷新命中条目为当天（无命中/超 20KB 不写盘）；
   ④ 清理方向 8 长期未用（时间戳久未刷新优先审查，不引用 memory_search/OCM）。
   单测 80/80 全绿、bun smoke 5/5
+- **v5.3（2026-11-05）**：收紧准入门槛，阻断「规范累积 → token 消耗 → 压缩更频繁 → 更多规范」恶性循环——
+  ① 提示词改用 **Claude auto memory 四类口径**（user / feedback / project / reference）+ 硬排除清单
+     （可从代码推导 / 一次性安排 / 已交付产物写法 / 行业公开知识 / AGENTS.md 已有）+ 宁缺毋滥；
+  ② 新增**每批条数上限**（默认 2，`EXP_SIMPLE_MAX_PER_BATCH`）——最强杠杆，实测 -55.4%（≤1 则 -76.9%）；
+  ③ 新增**近重复检测**（2-gram Jaccard ≥0.55，种子=已有 AGENTS.md 条目 + 本批已选）；
+  ④ 新增**用户信号优先排序**（不硬排，避免误杀高价值通用技术坑）；
+  ⑤ 新增**纯代码兜底**（极窄，仅拦"整条就是代码"）。
+  单测 72/72 全绿、bun smoke 5/5
+- **v5.4（2026-11-05）**：注入点全量对齐 —— ① 回收提醒的清理标准改成与写入侧**同一把尺子**
+  （Claude 四类 + 硬排除清单），"重复同义"改为按语义判（措辞不同也算同义）；
+  ② `countMdEntries` **排除外部注入块**（`<!-- XXX:START/END -->`）——原统计把别的插件写的条目也算了，
+  导致阈值失真（实测自有 11 条 / 外部 39 条 / 计数 50），且可能让模型去删标注了不可手改的块；
+  ③ 提取指令里的条目数措辞改为"自有条目数"。
+  单测 75/75 全绿、bun smoke 5/5
 OCM HTTP API 未就绪（stub 已留，不影响简单经验链路）。

@@ -26,8 +26,13 @@
  *   EXP_SIMPLE_MAX_WORDS        simple 单条上限, 单位=词 (默认 35, 兜底防 LLM 百字长句冒充)
  *                                词数 = 汉字数 + 英文单词数 (一个标识符算一词)
  *                                另配 120 字符硬顶, 防无空格长串绕过词数口径
+ *   EXP_SIMPLE_MAX_PER_BATCH    每次压缩最多沉淀几条 (默认 2, 收紧准入门槛的主杠杆;
+ *                                1 = 更狠, 0 视为非法值回落默认)
  *   EXP_REVIEW_ENABLED          关闭插件 (默认 true)
  *   EXP_OPENCODE_DB_PATH        opencode.db 路径 (默认 ~/.local/share/opencode/opencode.db)
+ *
+ * 准入门槛 (详见 README「准入门槛」, 对齐 Claude auto memory 四类口径):
+ *   长度护栏 → 纯代码兜底 → 近重复检测 → 用户信号优先排序 → 每批条数上限
  *
  * 验证 (重启 opencode 后):
  *   单元: node --test test/ (零依赖)
@@ -92,6 +97,25 @@ const SIMPLE_MAX_WORDS =
  * 词数<=35 的通过项最长 113 字符, 故 120 字符硬顶在真实数据上零损失。
  */
 const SIMPLE_MAX_CHARS_HARD = 120
+
+/**
+ * 每批提取条数上限 (默认 2 条/批) —— 收紧准入门槛的**最强杠杆**。
+ *
+ * 为什么不是"单条太长"而是"条数太多": 历史上 135 个压缩批次共产出 676 条,
+ * 平均每批 5 条、最多的一批出 13 条。AGENTS.md 膨胀的主因是**条数**, 不是单条长度。
+ * 离线评估 (676 条真实历史提取, 基线 = 现行长度护栏 609 条 / ~17.3k token):
+ *   + 每批 ≤2 → 259 条 / ~7.7k token  (-55.4%)
+ *   + 每批 ≤1 → 133 条 / ~4.0k token  (-76.9%)
+ * 对齐 Claude auto memory 的取向: 宁缺毋滥 (MEMORY.md 上限 200 行, 写满即报错要求重写)。
+ */
+const DEFAULT_SIMPLE_MAX_PER_BATCH = 2
+const envPerBatch = Number(process.env.EXP_SIMPLE_MAX_PER_BATCH)
+const SIMPLE_MAX_PER_BATCH =
+  Number.isFinite(envPerBatch) && envPerBatch > 0 ? envPerBatch : DEFAULT_SIMPLE_MAX_PER_BATCH
+
+/** 近重复阈值 (2-gram Jaccard): 字面去重 (`existing.includes`) 拦不住同义改写 */
+const NEAR_DUP_THRESHOLD = 0.55
+
 /** cursor 文件: 每项目 .experience-reviewer/experience-cursor.json */
 const CURSOR_FILE = join('.experience-reviewer', 'experience-cursor.json')
 
@@ -138,6 +162,70 @@ function wordCount(text) {
   // 连字符算标识符内部 (experience-reviewer = 1 词), 与"一个标识符算一词"一致
   const en = text.match(/[A-Za-z][A-Za-z0-9_-]*/g)
   return (cjk ? cjk.length : 0) + (en ? en.length : 0)
+}
+
+/**
+ * 归一化 2-gram 集合 (近重复比对用)。
+ * 去掉空格与中英文标点, 只留实词字符 —— 避免"标点/空格不同"的措辞差异干扰判定。
+ */
+function bigrams(text) {
+  const s = String(text || '').replace(/[\s，。、,.:;()（）`"'…·、！？]/g, '')
+  const out = new Set()
+  for (let i = 0; i < s.length - 1; i += 1) out.add(s.slice(i, i + 2))
+  if (!out.size && s) out.add(s)
+  return out
+}
+
+/**
+ * 与给定 2-gram 集合列表里任一条是否近重复 (Jaccard >= 阈值)。
+ *
+ * 为什么要它: 现行去重只有字面 `existing.includes(text)`, 同义改写
+ * (例: "lazy import 的 `_impl_path` 必须调用 `.resolve()` 转绝对路径"
+ *      vs "lazy import 的 `_impl_path` 必须 `.resolve()` 转绝对路径")
+ * 会各写一遍 —— 实测 335 条存量里检出 13 对近重复, 其中 1 对 Jaccard=1.00。
+ */
+function isNearDuplicate(text, gramList, threshold = NEAR_DUP_THRESHOLD) {
+  const g = bigrams(text)
+  if (!g.size) return false
+  for (const other of gramList) {
+    if (!other || !other.size) continue
+    let inter = 0
+    for (const x of g) if (other.has(x)) inter += 1
+    if (!inter) continue
+    const union = g.size + other.size - inter
+    if (union > 0 && inter / union >= threshold) return true
+  }
+  return false
+}
+
+/**
+ * 用户信号 (Claude auto memory 的 user / feedback 两类): 用户明确表达的
+ * 角色、偏好、纠正。
+ *
+ * ⚠️ 只用于**排序** (同额度下优先保留), **不做硬排**。
+ * 硬排会大面积误伤: 实测 676 条历史提取里被"无用户字样"拒掉的 463 条中,
+ * 大量是高价值通用技术坑 (例: "V2 plugin ctx 拿项目目录用 ctx.directory")。
+ * 改用排序后, 同样额度下留下的条目明显更好, 又不丢条目。
+ */
+const USER_SIGNAL_RE =
+  /用户|明确|偏好|反感|禁止|不得|必须先|不要|只能|要求|建议|纠正|反对|别再|改成|应该/
+function hasUserSignal(text) {
+  return USER_SIGNAL_RE.test(String(text || ''))
+}
+
+/**
+ * 纯代码兜底: 整条基本就是一段代码 (不是"经验")。
+ *
+ * ⚠️ 刻意做得**极窄**: 中文语境下用"文件路径 / snake_case 标识符 / module.attr"
+ * 这类启发式会大面积误伤 —— 实测连 "AGENTS.md" 这种文档路径都能命中,
+ * 把「用户明确不迁全局也不留项」这种用户偏好条目也误杀了 (H1 档误伤 66 条)。
+ * 所以路径/标识符启发式**全部交给提示词侧** (模型判"能否从代码推导"),
+ * 插件侧只兜"整条就是代码"这种极端情况 (真实数据上 0 命中, 纯安全网)。
+ */
+const CODE_ONLY_RE =
+  /^\s*(?:def |class |import |from \w+ import |function |const |let |var |public |private )|=>\s*\{|;\s*$|\{\s*['"][^'"]+['"]\s*:\s*|\brequire\(['"]|\bimport\s*\{[^}]+\}\s*from/m
+function looksLikeCode(text) {
+  return CODE_ONLY_RE.test(String(text || ''))
 }
 
 function debugLog(msg) {
@@ -256,9 +344,37 @@ function stampEntryLine(line, stamp) {
     : `- ${stamp} ${body}`
 }
 
-/** 统计 AGENTS.md 中 `- ` 开头的一行经验条目数 */
+/**
+ * 外部注入块标记 (形如 `<!-- XXX:START ... -->` / `<!-- XXX:END -->`)。
+ * 这类块由**别的插件**写入, 不是本项目自己写的规范条目。
+ */
+const EXTERNAL_BLOCK_START_RE = /<!--\s*[A-Za-z0-9_.-]+:START/
+const EXTERNAL_BLOCK_END_RE = /<!--\s*[A-Za-z0-9_.-]+:END/
+
+/**
+ * 统计 AGENTS.md 中 `- ` 开头的一行经验条目数。
+ *
+ * ⚠️ **排除外部注入块** (`<!-- XXX:START -->` .. `<!-- XXX:END -->` 之间的内容):
+ *   那些条目由别的插件写入, 不是本项目自己的规范。计进来有两个问题:
+ *   ① 回收提醒被外部内容提前触发 (实测某项目自有条目 11 条, 外部块 39 条, 合计计数 50 → 阈值判断失真);
+ *   ② 提醒里"按标准顺手清理"会让模型去删注入块里的行 —— 那块标注了不可手改。
+ */
 function countMdEntries(content) {
-  return content.split('\n').filter((line) => line.trim().startsWith('- ')).length
+  let count = 0
+  let inExternal = false
+  for (const line of String(content || '').split('\n')) {
+    if (EXTERNAL_BLOCK_START_RE.test(line)) {
+      inExternal = true
+      continue
+    }
+    if (EXTERNAL_BLOCK_END_RE.test(line)) {
+      inExternal = false
+      continue
+    }
+    if (inExternal) continue
+    if (line.trim().startsWith('- ')) count += 1
+  }
+  return count
 }
 
 function recycleTargetCount() {
@@ -346,13 +462,23 @@ function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
     '{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"usedEntries":["..."]}\n' +
     '\n' +
     '规则：\n' +
-    '1. simple: 单条 ≤35 词单句（中文按字算，英文按单词算，一个标识符算一词）；scope 一律 project；只能沉淀「未来还会被反复应用的规则/偏好/教训」\n' +
-    '2. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
-    '3. 排除（绝不输出）：可从代码/文档推导、一次性任务安排、特定 skill 专属规则、已存过/高度相似、已交付产物的写法/格式、行业公开知识\n' +
-    '4. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
-    '5. 无内容 → 必须输出 {"simple":[],"usedEntries":[]}，不是省略，不是空骨架\n' +
-    '6. 当前项目概述：' + (projectOverview || '(无)') + '\n' +
-    '7. 项目 AGENTS.md 现有条目数：' + entryCount + '（仅供参考，不限制提取）\n' +
+    '1. simple: 单条 ≤35 词单句（中文按字算，英文按单词算，一个标识符算一词）；scope 一律 project\n' +
+    '2. 只沉淀以下四类之一，其余一律不输出：\n' +
+    '   · user      用户的角色 / 长期偏好\n' +
+    '   · feedback  用户的纠正与确认（AI 反复犯的错）\n' +
+    '   · project   从代码推导不出的项目决策 / 红线 / 进行中工作\n' +
+    '   · reference 项目外部资源的位置（数据源 / 模板 / 账号入口）\n' +
+    '3. 硬排除（绝不输出）：\n' +
+    '   · 能从代码/仓库/文档推导出来的（架构、文件路径、函数名、行号、调试修复过程、实现的取值）\n' +
+    '   · 当次任务的一次性安排、已交付产物的写法/格式\n' +
+    '   · 行业公开知识、模型本来就会的常识\n' +
+    '   · AGENTS.md 里已经有的（哪怕措辞不同）\n' +
+    '4. 宁缺毋滥：本次最多输出 ' + SIMPLE_MAX_PER_BATCH + ' 条；没有符合第 2 条的，一律输出空数组，不要凑数\n' +
+    '5. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
+    '6. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
+    '7. 无内容 → 必须输出 {"simple":[],"usedEntries":[]}，不是省略，不是空骨架\n' +
+    '8. 当前项目概述：' + (projectOverview || '(无)') + '\n' +
+    '9. 项目 AGENTS.md 现有自有条目数：' + entryCount + '（仅供参考，不限制提取）\n' +
     '\n' +
     '输出顺序：先写摘要正文 → 摘要末尾追加独立的 ```json``` 块。JSON 块必须存在、必须填满。'
   return {
@@ -543,7 +669,7 @@ function createExperienceReviewer(deps) {
     )
 
     const before = readMdSafe()
-    if (simple.length) writeSimpleEntries(simple)
+    const simpleWrote = simple.length ? writeSimpleEntries(simple) : 0
     if (usedEntries.length) refreshUsageStamps(usedEntries)
     const after = readMdSafe()
     const wrote = before !== after
@@ -557,7 +683,8 @@ function createExperienceReviewer(deps) {
 
     log(
       `COMPACTION_DONE sid=${sessionID ?? '-'} event=${eventID ?? '-'} ` +
-        `simpleWrote=${simple.length} usedWrote=${usedEntries.length} wroteFile=${wrote}`
+        `simple=${simple.length} simpleWrote=${simpleWrote} ` +
+        `cap=${SIMPLE_MAX_PER_BATCH} usedWrote=${usedEntries.length} wroteFile=${wrote}`
     )
     return { ok: true, simple, usedEntries }
   }
@@ -576,6 +703,16 @@ function createExperienceReviewer(deps) {
   }
 
   // ── AGENTS.md 写入 (v5 主落点) ──
+  /**
+   * 准入门槛 (按顺序执行, 详见 README「准入门槛」):
+   *   1. 长度护栏   : ≤35 词 且 ≤120 字符 (单条)
+   *   2. 纯代码兜底 : 整条就是一段代码 → 拒
+   *   3. 近重复     : 2-gram Jaccard ≥0.55 与已有条目/本批已选重复 → 拒
+   *   4. 用户信号优先: 同额度下, 带用户明确表达的条目排前面 (排序, 不硬排)
+   *   5. 每批条数上限: 最多写 SIMPLE_MAX_PER_BATCH 条 (默认 2)
+   *
+   * 对齐 Claude auto memory 的取向: 宁缺毋滥, 只留「用户纠正/偏好/项目决策/外部资源」四类。
+   */
   function writeSimpleEntries(entries) {
     if (!entries.length) return
     const path = join(directory, 'AGENTS.md')
@@ -586,7 +723,17 @@ function createExperienceReviewer(deps) {
       log(`MD_READ_FAIL path=${path} error=${String(error)}`)
       return
     }
-    let added = ''
+
+    // 近重复种子 = 已有 AGENTS.md 里的每条经验 (剥掉标记与日期戳后比对)
+    const seedGrams = []
+    for (const line of existing.split('\n')) {
+      if (!line.trim().startsWith('- ')) continue
+      const body = stripEntryStamp(line)
+      if (body.length >= 3) seedGrams.push(bigrams(body))
+    }
+
+    // 门槛 1~3: 逐条过滤
+    const candidates = []
     for (const e of entries) {
       const text = e?.text
       if (!text) continue
@@ -598,6 +745,31 @@ function createExperienceReviewer(deps) {
         )
         continue
       }
+      if (looksLikeCode(text)) {
+        log(`MD_CODE_SKIP skipped="${text.slice(0, 30)}…"`)
+        continue
+      }
+      if (isNearDuplicate(text, seedGrams)) {
+        log(`MD_NEAR_DUP skipped="${text.slice(0, 30)}…"`)
+        continue
+      }
+      candidates.push(e)
+    }
+
+    // 门槛 4: 用户信号优先 (稳定排序, 同类保持原顺序)
+    candidates.sort((a, b) => Number(hasUserSignal(b?.text)) - Number(hasUserSignal(a?.text)))
+
+    // 门槛 5: 每批条数上限 (写满即停; MD_FULL 的条目不占额度)
+    let written = 0
+    let added = ''
+    for (const e of candidates) {
+      if (written >= SIMPLE_MAX_PER_BATCH) {
+        log(
+          `MD_BATCH_CAP cap=${SIMPLE_MAX_PER_BATCH} skipped="${String(e?.text).slice(0, 30)}…"`
+        )
+        break
+      }
+      const text = e.text
       if (existing.includes(text) || added.includes(text)) continue // 去重 (原文)
       const stamp = `[${dateStamp(now())}] `
       const line = `- ${e.suggestGlobal ? `${SUGGEST_GLOBAL_MARKER}${stamp}${text}` : `${stamp}${text}`}`
@@ -606,17 +778,23 @@ function createExperienceReviewer(deps) {
         continue
       }
       added += line + '\n'
+      written += 1
     }
     if (!added) {
       log(`MD_NOOP entries=${entries.length} reason=all-duplicate-or-full`)
-      return
+      return 0
     }
     try {
       const sep = existing && !existing.endsWith('\n') ? '\n' : ''
       write(path, existing + sep + added, 'utf8')
-      log(`MD_WRITE path=${path} newEntries=${entries.length} bytes=${(existing + sep + added).length}`)
+      log(
+        `MD_WRITE path=${path} newEntries=${written} cap=${SIMPLE_MAX_PER_BATCH} ` +
+          `bytes=${(existing + sep + added).length}`
+      )
+      return written
     } catch (error) {
       log(`MD_WRITE_FAIL path=${path} error=${String(error)}`)
+      return 0
     }
   }
 
@@ -755,16 +933,17 @@ function createExperienceReviewer(deps) {
     const target = recycleTargetCount()
     const projectName = directory.split(/[\\/]/).filter(Boolean).pop() ?? '未知项目'
     const reminder =
-      `【${projectName}】AGENTS.md 经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
+      `【${projectName}】AGENTS.md 自有经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
       `你自处理即可, 不必逐条展开处理过程——可在任务间隙按以下标准顺手处理:\n` +
-      `1. 准入门槛 + 可复用性: 必须是「可参考、可执行的规范」+ 未来会被反复应用; 拒绝事实性描述/一次性描述(已交付产物写法)/与项目概述重叠/行业平台公开知识\n` +
+      `1. 准入门槛(与新沉淀用同一把尺子): 必须属四类之一——user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 四类都不沾 → 删。一律删: 能从代码/文档推导出来的、当次任务的一次性安排、已交付产物的写法/格式、行业公开知识、与项目概述重叠的\n` +
       `2. 已解决\n` +
-      `3. 重复同义\n` +
+      `3. 重复同义: 说的是同一件事就只留一条(措辞不同也算同义, 不必字面相同)\n` +
       `4. 作用域错位\n` +
       `5. 同一主题拆多条\n` +
       `6. 低频占常驻\n` +
       `7. 依赖环境已变化\n` +
       `8. 长期未用: 时间戳久未刷新(或无时间戳且创建已久)的条目 → 优先审查删除; 结合本会话印象, 拿不准的保留\n` +
+      `只处理本项目自己写的条目, 不要动 <!-- XXX:START/END --> 这类外部注入块。\n` +
       `不挤占主任务输出带宽, 不必立刻处理。`
     appendSyntheticText(lastUser, `\n\n${reminder}`)
     log(`RECYCLE_REMINDER injected count=${count}`)
@@ -812,7 +991,7 @@ const plugin = {
   id: 'opencode-experience-reviewer',
   setup: async (ctx) => {
     debugLog(
-      `setup() STARTED ${MARKER} v5.2(compact-hook+jsonfix+wordcap) maxMdBytes=${MAX_MD_BYTES} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5.4(injection-align) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
     )
     if (!ENABLED) {
       debugLog('setup() DISABLED (ENABLED=false)')
@@ -960,4 +1139,8 @@ export {
   stampEntryLine,
   normalizeProjectDir,
   wordCount,
+  bigrams,
+  isNearDuplicate,
+  hasUserSignal,
+  looksLikeCode,
 }

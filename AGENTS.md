@@ -1,18 +1,20 @@
 > **项目概述**: 本项目是 opencode 修改资产与部署手册仓库，收录解决具体痛点的插件（watchdog 卡死检测 / task-context-injector 子代理上下文注入 / experience-reviewer 经验提取）及运维脚本，每个子项目可独立验证、可回滚。
-- experience-reviewer 插件默认触发条件: ≥3 轮用户消息 或 ≥10 分钟, 可用 EXP_REVIEW_ROUND_INTERVAL / EXP_REVIEW_TIME_INTERVAL_MS 环境变量覆盖(只 spawn 时加载)
-- experience-reviewer 插件轮次触发是废的: roundsSince = 当前 session 内用户消息数 − 全局 cursor 基线 lastReviewRound, 跨 session 恒为 0 (负数被 clamp), 不是"对话不算", 真正可靠的是时间触发 timeHit (600s)。
+- experience-reviewer v5 只在 session.compaction.ended 触发(搭 compact 的模型调用顺带提取), 没有轮次/时间触发; v2/v3 的 EXP_REVIEW_ROUND_INTERVAL / EXP_REVIEW_TIME_INTERVAL_MS / EXP_REVIEW_MAX_MESSAGES / fireReview 已全部移除, 看到这些变量名即为过时文档
+- experience-reviewer v5 零额外模型调用: 借 compact 摘要那一次模型调用同时产出 summary+JSON, 提取指令固定段追加在 compact prompt 末尾(不破坏主会话 transcript 的 KV cache 前缀)
 - 项目同时支持 node + bun 双运行时, 改完核心逻辑除了跑全量 Jest 测试, 还要跑 bun smoke 验双运行时兼容
-- 轮次列表里 user 文本以「你是经验提取器」开头的都是 experience-reviewer 的 subagent 自污染轮, 不是真用户对话
-- 经验沉淀按长度分流: 短(simple)→AGENTS.md注入, 长(complex多行)→OCM经验表, 总结用最简语言
+- 经验沉淀 v5 只走 simple 路径: ≤35 词单句写入项目 AGENTS.md; v2 的"长条目走独立经验库"分流在 v5 已不产出 complex, 相关 HTTP 导出仅保留给测试用
 - 提取提示词的 simple 约束必须量化(≤35 词单句，汉字按字、英文按单词，一个标识符算一词), 仅写"一句话"会让 LLM 输出百字长句冒充
-- 提取范围: 只留用户明说的长期要求和反复踩的坑; 当次任务的一次性安排、代码可推导的、已存过的不提取, 只留未来对话还用得上的
+- 提取范围按 Claude auto memory 四类口径: user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 硬排除可从代码推导、一次性安排、已交付产物写法、行业公开知识、AGENTS.md 已有
 - 验证 KV cache 命中率从模型返回的 usage.tokens.cache.read/write 拿, 写进 cursor 统计字段
 - 提取 prompt 的 KV cache 友好结构 = 对话前置 + 规则最末 (v1 结构为最终正确): 稳定段 = 与主会话共享的 system+对话前缀, 放最前; 自定义规则段前置会截断共享前缀, 命中率降至其占比 (~5%), 生产多项目实测对话前置 ~98%; 曾翻面(规则前置)后所有项目跌 ~5% 已回滚; 删工具调用但保留工具返回内容、且去调用后前缀仍稳定才能命中; 验证 cache 提升不能靠 E2E rewind 同源切片 (人造 99% vs 生产 5%), 必须真实生产多项目实测
 - AGENTS.md 是项目级变量, 塞进 subagent 会把固定前缀变变量前缀, 摧毁缓存复用
 - MiniMax 缓存即前缀匹配且不认 session: 提取请求对话段与主会话累积历史前缀一致即命中(跨 REVIEW 98%)
 - review 提取结果 PROMPT_LEN=0 时先查 cursor 窗口内是否有"完整轮次"(user 消息 + 对应 assistant 回复)；若唯一新 user 消息尚无 assistant 回复则无完整轮次，诊断需把 cursor 前移到最近完整轮次之前再重查 DB 轮次边界。
 - 开关拦截双点: 最早钩子入口先拦(不写 cursor=零开销), 直接调用入口兜底
-- 经验写入只追加无回收，同义改写能绕过字面去重
+- 经验写入只追加无回收; 同义改写能绕过字面去重 → v5.3 已加 2-gram Jaccard≥0.55 近重复检测(种子=已有 AGENTS.md 条目+本批已选), 335 条存量实测检出 13 对近重复
+- 收紧经验准入的主杠杆是"每批条数上限"(默认 2, EXP_SIMPLE_MAX_PER_BATCH), 不是单条长度: 676 条历史提取实测每批≤2 降 55.4%, ≤1 降 76.9%
+- 中文语境下用正则硬排"代码可推导"误伤率高: AGENTS.md 这类文档路径就命中, 把用户明确偏好也误杀(66 条) → 该判据交给提示词侧让模型判, 插件侧只兜"整条就是代码"
+- "用户信号/用户锚点"只能用于排序不能用于硬排: 硬排会误杀"V2 plugin ctx 拿项目目录用 ctx.directory"这类高价值通用技术坑
 - 项目身份不能只靠路径和文件夹名，需在提示词注入一行项目自述
 - 从 AGENTS.md 提取项目概述不可靠：多数项目 AGENTS.md 全是规则条目，无一句自述
 - 纯净 subagent 冷提取看不到代码库，是经验过度泛化的结构性原因
@@ -84,9 +86,9 @@
 - **经验 scope 归类抖动的根因与修法** `id=d2cdaa13-c1ec-427e-ab99-b8a5e9229254` (project / dev)
   使用时机: 写经验提取提示词，或发现同一内容在不同批次被反复判成 project/global 时。不读代价: 全局 AGENTS.md 被项目级约定污染并持续膨胀，归类永远得靠人工返工。
   关键词: scope 归类, project/global, 硬判据, 建议全局
-- **Claude auto memory 的经验存取判定标准(可抄) + 项目自述注入方案** `id=866b2e5f-9b85-45cb-ad6a-09f5d56d4826` (project / process)
-  使用时机: 设计/调优 experience-reviewer 的提取门槛、归类规则、回收机制时,或判断某条内容该不该沉淀时。不读代价: 阈值凭感觉定,会误存一次性任务安排、漏存长期约定,全局 AGENTS.md 只增不减已膨胀到百行。
-  关键词: 经验分类, 提取门槛, Claude auto memory, project 自述, scope 归类, 回收机制
+- **Claude auto memory 四类口径(已落地) + 中文语境下过滤误伤的实测边界** `id=866b2e5f-9b85-45cb-ad6a-09f5d56d4826` (project / process)
+  使用时机: 设计/调优经验提取门槛、归类规则、回收机制,或判断某条内容该不该沉淀时。不读代价: 把"代码可推导""用户锚点"做成插件侧正则硬排会大面积误伤(文档路径就命中, 66 条用户偏好被误杀), 且会误判膨胀主因是单条长度而非每批条数。
+  关键词: 经验分类, 提取门槛, Claude auto memory, 四类口径, 每批上限, 近重复检测, 误伤, 正则硬排
 - **验证 opencode 插件注入是否真到达主 agent** `id=097c300e-ba10-40fb-af90-9afe895212fa` (project / process)
   使用时机: 改插件注入文案/新增注入逻辑后做端到端验证时。不读代价: 会把旧实例残留或 cursor 标记误判成注入失效, 反复空转。
   关键词: 注入验证, opencode reload, 版本串, 端到端, experience-reviewer
