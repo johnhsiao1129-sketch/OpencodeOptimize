@@ -469,11 +469,12 @@ function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
     '   · project   从代码推导不出的项目决策 / 红线 / 进行中工作\n' +
     '   · reference 项目外部资源的位置（数据源 / 模板 / 账号入口）\n' +
     '3. 硬排除（绝不输出）：\n' +
+    '   · 用户布置的任务/指令本身（"要我做什么" ≠ "以后怎么做"；任务不是规范）\n' +
     '   · 能从代码/仓库/文档推导出来的（架构、文件路径、函数名、行号、调试修复过程、实现的取值）\n' +
     '   · 当次任务的一次性安排、已交付产物的写法/格式\n' +
     '   · 行业公开知识、模型本来就会的常识\n' +
     '   · AGENTS.md 里已经有的（哪怕措辞不同）\n' +
-    '4. 宁缺毋滥：本次最多输出 ' + SIMPLE_MAX_PER_BATCH + ' 条；没有符合第 2 条的，一律输出空数组，不要凑数\n' +
+    '4. 宁缺毋滥：本次 0~' + SIMPLE_MAX_PER_BATCH + ' 条皆可（' + SIMPLE_MAX_PER_BATCH + ' 是上限不是目标）；1 条、0 条都正常，绝不凑数\n' +
     '5. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
     '6. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
     '7. 无内容 → 必须输出 {"simple":[],"usedEntries":[]}，不是省略，不是空骨架\n' +
@@ -935,7 +936,7 @@ function createExperienceReviewer(deps) {
     const reminder =
       `【${projectName}】AGENTS.md 自有经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
       `你自处理即可, 不必逐条展开处理过程——可在任务间隙按以下标准顺手处理:\n` +
-      `1. 准入门槛(与新沉淀用同一把尺子): 必须属四类之一——user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 四类都不沾 → 删。一律删: 能从代码/文档推导出来的、当次任务的一次性安排、已交付产物的写法/格式、行业公开知识、与项目概述重叠的\n` +
+      `1. 准入门槛(与新沉淀用同一把尺子): 必须属四类之一——user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 四类都不沾 → 删。一律删: 用户布置的任务/指令本身、能从代码/文档推导出来的、当次任务的一次性安排、已交付产物的写法/格式、行业公开知识、与项目概述重叠的\n` +
       `2. 已解决\n` +
       `3. 重复同义: 说的是同一件事就只留一条(措辞不同也算同义, 不必字面相同)\n` +
       `4. 作用域错位\n` +
@@ -991,7 +992,7 @@ const plugin = {
   id: 'opencode-experience-reviewer',
   setup: async (ctx) => {
     debugLog(
-      `setup() STARTED ${MARKER} v5.4(injection-align) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5.5(task-not-entry) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
     )
     if (!ENABLED) {
       debugLog('setup() DISABLED (ENABLED=false)')

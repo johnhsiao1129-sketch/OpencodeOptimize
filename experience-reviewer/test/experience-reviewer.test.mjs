@@ -652,6 +652,8 @@ test('ensureRecycleReminder: 清理标准与写入侧四类口径对齐 + 保护
     assert.match(text, new RegExp(k))
   }
   assert.match(text, /四类都不沾 → 删/)
+  // 清理侧同样排除「用户布置的任务/指令本身」(与写入侧同一把尺子, v5.5)
+  assert.match(text, /一律删: 用户布置的任务\/指令本身/)
   assert.match(text, /重复同义/)
   assert.match(text, /措辞不同也算同义/)
   // 外部注入块保护
@@ -995,9 +997,14 @@ test('extractionInstructionForCompact: 含 Claude 四类口径 + 硬排除 + 每
   // 硬排除清单
   assert.match(text, /能从代码\/仓库\/文档推导出来的/)
   assert.match(text, /行业公开知识/)
-  // 宁缺毋滥 + 动态告知上限
-  assert.match(text, /最多输出 2 条/)
-  assert.match(text, /不要凑数/)
+  // 硬排除: 用户任务/指令本身不算规范 (v5.5)
+  assert.match(text, /用户布置的任务\/指令本身/)
+  assert.match(text, /任务不是规范/)
+  // 宁缺毋滥 + 动态告知上限 (上限不是目标, 0~N 皆可)
+  assert.match(text, /0~2 条皆可/)
+  assert.match(text, /上限不是目标/)
+  assert.match(text, /绝不凑数/)
+  assert.doesNotMatch(text, /最多输出 2 条/) // 旧措辞不许复活
   // 旧口径不许复活
   assert.match(text, /≤35 词/)
   assert.doesNotMatch(text, /≤50 字/)
