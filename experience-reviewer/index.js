@@ -23,15 +23,15 @@
  *
  * 配置 (环境变量, 全可选):
  *   EXP_REVIEW_MAX_MD_BYTES     AGENTS.md 上限 (默认 20KB)
- *   EXP_SIMPLE_MAX_WORDS        simple 单条上限, 单位=词 (默认 35, 兜底防 LLM 百字长句冒充)
+ *   EXP_SIMPLE_MAX_WORDS        simple 单条上限, 单位=词 (默认 45, 兜底防 LLM 百字长句冒充)
  *                                词数 = 汉字数 + 英文单词数 (一个标识符算一词)
- *                                另配 120 字符硬顶, 防无空格长串绕过词数口径
+ *                                另配 160 字符硬顶, 防无空格长串绕过词数口径
  *   EXP_SIMPLE_MAX_PER_BATCH    每次压缩最多沉淀几条 (默认 2, 收紧准入门槛的主杠杆;
  *                                1 = 更狠, 0 视为非法值回落默认)
  *   EXP_REVIEW_ENABLED          关闭插件 (默认 true)
  *   EXP_OPENCODE_DB_PATH        opencode.db 路径 (默认 ~/.local/share/opencode/opencode.db)
  *
- * 准入门槛 (详见 README「准入门槛」, 对齐 Claude auto memory 四类口径):
+ * 准入门槛 (详见 README「准入门槛」, v5.6 改为「用户侧准则」口径):
  *   长度护栏 → 纯代码兜底 → 近重复检测 → 用户信号优先排序 → 每批条数上限
  *
  * 验证 (重启 opencode 后):
@@ -43,7 +43,7 @@
  *
  * 历史遗留 (保留 exports, v5 不再调用, 但 OCM 复杂经验路径测试与代码原样保留):
  *   storeComplexExperience, queryExperiences → OCM HTTP API (complex → DB)
- *   v5 只处理 simple (≤35 词单句, 写 AGENTS.md)
+ *   v5 只处理 simple (≤45 词单句, 写 AGENTS.md)
  */
 import {
   readFileSync,
@@ -90,13 +90,12 @@ const envMax = Number(process.env.EXP_REVIEW_MAX_MD_BYTES)
 const MAX_MD_BYTES = Number.isFinite(envMax) && envMax > 0 ? envMax : DEFAULT_MAX_MD_BYTES
 const envSimpleMax = Number(process.env.EXP_SIMPLE_MAX_WORDS)
 const SIMPLE_MAX_WORDS =
-  Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 35
+  Number.isFinite(envSimpleMax) && envSimpleMax > 0 ? envSimpleMax : 45
 /**
  * 字符硬顶: 词数口径只数"有几个词", 对无空格长串 (base64/长标识符/整段代码)
- * 会算成 1 个词而放行。374 条真实样本实测最长英文 token 仅 25 字符、
- * 词数<=35 的通过项最长 113 字符, 故 120 字符硬顶在真实数据上零损失。
+ * 会算成 1 个词而放行。v5.6 随词数上限一起放宽到 160 字符 (原 120)。
  */
-const SIMPLE_MAX_CHARS_HARD = 120
+const SIMPLE_MAX_CHARS_HARD = 160
 
 /**
  * 每批提取条数上限 (默认 2 条/批) —— 收紧准入门槛的**最强杠杆**。
@@ -451,7 +450,7 @@ function parseReviewOutput(stdout) {
  */
 function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
   const text =
-    '【附加任务 · 必须完成 · 不可省略】在你即将给出的对话摘要之后，必须额外输出一段 fenced ```json 代码块，列出本对话中**值得沉淀为简单经验**的条目。\n' +
+    '【附加任务 · 必须完成 · 不可省略】在你即将给出的对话摘要之后，必须额外输出一段 fenced ```json 代码块，列出本对话中值得沉淀为经验的条目。\n' +
     '\n' +
     '⚠️ 严禁：\n' +
     '· 省略 JSON 块 / 用 "无内容" 一句带过 / 把 JSON 塞进摘要正文段落里\n' +
@@ -459,27 +458,28 @@ function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
     '· 输出 markdown 解释文字或额外标题，只允许一段纯 ```json``` 块\n' +
     '\n' +
     '格式（外层 ```json 包裹，不要 markdown 多余文本）：\n' +
-    '{"simple":[{"scope":"project","text":"...","suggestGlobal":false}],"usedEntries":["..."]}\n' +
+    '{"simple":[{"level":"T0","scope":"project","text":"...","suggestGlobal":false}],"usedEntries":["..."]}\n' +
     '\n' +
-    '规则：\n' +
-    '1. simple: 单条 ≤35 词单句（中文按字算，英文按单词算，一个标识符算一词）；scope 一律 project\n' +
-    '2. 只沉淀以下四类之一，其余一律不输出：\n' +
-    '   · user      用户的角色 / 长期偏好\n' +
-    '   · feedback  用户的纠正与确认（AI 反复犯的错）\n' +
-    '   · project   从代码推导不出的项目决策 / 红线 / 进行中工作\n' +
-    '   · reference 项目外部资源的位置（数据源 / 模板 / 账号入口）\n' +
-    '3. 硬排除（绝不输出）：\n' +
-    '   · 用户布置的任务/指令本身（"要我做什么" ≠ "以后怎么做"；任务不是规范）\n' +
-    '   · 能从代码/仓库/文档推导出来的（架构、文件路径、函数名、行号、调试修复过程、实现的取值）\n' +
-    '   · 当次任务的一次性安排、已交付产物的写法/格式\n' +
-    '   · 行业公开知识、模型本来就会的常识\n' +
-    '   · AGENTS.md 里已经有的（哪怕措辞不同）\n' +
-    '4. 宁缺毋滥：本次 0~' + SIMPLE_MAX_PER_BATCH + ' 条皆可（' + SIMPLE_MAX_PER_BATCH + ' 是上限不是目标）；1 条、0 条都正常，绝不凑数\n' +
-    '5. suggestGlobal=true: 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
-    '6. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
-    '7. 无内容 → 必须输出 {"simple":[],"usedEntries":[]}，不是省略，不是空骨架\n' +
-    '8. 当前项目概述：' + (projectOverview || '(无)') + '\n' +
-    '9. 项目 AGENTS.md 现有自有条目数：' + entryCount + '（仅供参考，不限制提取）\n' +
+    '要什么（最多 ' + SIMPLE_MAX_PER_BATCH + ' 条，级别从高到低）：\n' +
+    'T0 用户对未来行为的普适约束：偏好 / 规范 / 红线，尤其是他反复强调的同一件事\n' +
+    'T1 用户对 agent 行为的批评与褒奖\n' +
+    'T2 你自己重复犯（≥2 次）且造成实际损失（返工 / 数据错误 / 用户不满）的错\n' +
+    '\n' +
+    '不要什么（T0/T1/T2 之外的一律不写）：\n' +
+    '你本次工作里得知、决定或做过的一切 —— 做了什么、怎么做的、改了哪些文件、选了什么库与参数、\n' +
+    '发现了什么技术事实、排了什么错、测得什么数据、下一步打算做什么 —— 都是工作内容，不是经验。\n' +
+    '哪怕它很冷门、你觉得以后可能用得上，也不写。AGENTS.md 里已有的（措辞不同也算）也不写。\n' +
+    '\n' +
+    '怎么判断：问自己这条写的是"这次做的事"还是"以后每次做事都适用的准则"。前者不写，后者才写。\n' +
+    '来源：只写用户明确说过的，或你自己重复犯过的错；说不清来源的不写。\n' +
+    '\n' +
+    '其他：\n' +
+    '1. 单条 ≤' + SIMPLE_MAX_WORDS + ' 词（汉字按字算，英文按单词算，一个标识符算 1 词），≤' + SIMPLE_MAX_CHARS_HARD + ' 字符\n' +
+    '2. scope 一律 project；suggestGlobal=true 仅当「跨项目通用偏好」或「工具链通用坑」\n' +
+    '3. usedEntries: 本对话明显应用过的已有项目经验条目的前 10 字符（插件侧按项目 AGENTS.md 去重时使用）\n' +
+    '4. 没有够格的条目就写 {"simple":[],"usedEntries":[]}（空数组是正常结果，不要凑数）\n' +
+    '5. 当前项目概述：' + (projectOverview || '(无)') + '\n' +
+    '6. 项目 AGENTS.md 现有自有条目数：' + entryCount + '（仅供参考，不限制提取）\n' +
     '\n' +
     '输出顺序：先写摘要正文 → 摘要末尾追加独立的 ```json``` 块。JSON 块必须存在、必须填满。'
   return {
@@ -706,13 +706,14 @@ function createExperienceReviewer(deps) {
   // ── AGENTS.md 写入 (v5 主落点) ──
   /**
    * 准入门槛 (按顺序执行, 详见 README「准入门槛」):
-   *   1. 长度护栏   : ≤35 词 且 ≤120 字符 (单条)
+   *   1. 长度护栏   : ≤45 词 且 ≤160 字符 (单条)
    *   2. 纯代码兜底 : 整条就是一段代码 → 拒
    *   3. 近重复     : 2-gram Jaccard ≥0.55 与已有条目/本批已选重复 → 拒
    *   4. 用户信号优先: 同额度下, 带用户明确表达的条目排前面 (排序, 不硬排)
    *   5. 每批条数上限: 最多写 SIMPLE_MAX_PER_BATCH 条 (默认 2)
    *
-   * 对齐 Claude auto memory 的取向: 宁缺毋滥, 只留「用户纠正/偏好/项目决策/外部资源」四类。
+   * v5.6 取向: 宁缺毋滥, 只留「用户对未来行为的普适约束 / 用户的批评褒奖 / agent 重复犯的错」;
+   * 一切"本次工作内容"(实现细节 / 变更日志 / 调试过程 / 具体取值选型 / 技术事实) 一律不进。
    */
   function writeSimpleEntries(entries) {
     if (!entries.length) return
@@ -936,14 +937,10 @@ function createExperienceReviewer(deps) {
     const reminder =
       `【${projectName}】AGENTS.md 自有经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
       `你自处理即可, 不必逐条展开处理过程——可在任务间隙按以下标准顺手处理:\n` +
-      `1. 准入门槛(与新沉淀用同一把尺子): 必须属四类之一——user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 四类都不沾 → 删。一律删: 用户布置的任务/指令本身、能从代码/文档推导出来的、当次任务的一次性安排、已交付产物的写法/格式、行业公开知识、与项目概述重叠的\n` +
-      `2. 已解决\n` +
-      `3. 重复同义: 说的是同一件事就只留一条(措辞不同也算同义, 不必字面相同)\n` +
-      `4. 作用域错位\n` +
-      `5. 同一主题拆多条\n` +
-      `6. 低频占常驻\n` +
-      `7. 依赖环境已变化\n` +
-      `8. 长期未用: 时间戳久未刷新(或无时间戳且创建已久)的条目 → 优先审查删除; 结合本会话印象, 拿不准的保留\n` +
+      `留(仅限): 用户对未来行为的普适约束(偏好/规范/红线, 尤其反复强调的); 用户对 agent 行为的批评与褒奖; agent 自己重复犯(≥2 次)且造成实际损失的错\n` +
+      `删(凡属以下都是"工作内容", 不是经验): 描述本次做了什么/怎么做的(实现细节、算法步骤、规则编号、文件路径、函数名、字段含义); 本次工作里得知/决定/验证过的(技术事实、选型、具体取值、参数、端口、阈值、版本号); 变更日志、目录迁移、脚本重写、调试与修复过程、报错与根因、单次实测数据; 任务/工作内容/方案路线/工具操作步骤/一次性安排; AGENTS.md 里已有的、与项目概述重叠的\n` +
+      `判断口径与写入侧完全一致: 这条写的是"这次做的事"还是"以后每次做事都适用的准则" → 前者删, 后者留。\n` +
+      `同义重复(说的是同一件事, 措辞不同也算同义)只留一条; 长期未用(时间戳久未刷新, 或无时间戳且创建已久)的优先审查删除, 拿不准的保留。\n` +
       `只处理本项目自己写的条目, 不要动 <!-- XXX:START/END --> 这类外部注入块。\n` +
       `不挤占主任务输出带宽, 不必立刻处理。`
     appendSyntheticText(lastUser, `\n\n${reminder}`)
@@ -992,7 +989,7 @@ const plugin = {
   id: 'opencode-experience-reviewer',
   setup: async (ctx) => {
     debugLog(
-      `setup() STARTED ${MARKER} v5.5(task-not-entry) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5.6(user-norm+work-content-excluded) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
     )
     if (!ENABLED) {
       debugLog('setup() DISABLED (ENABLED=false)')

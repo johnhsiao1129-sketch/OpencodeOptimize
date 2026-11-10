@@ -207,11 +207,12 @@ test('wordCount: 标点与空格不计词', () => {
   assert.equal(wordCount('A，B，C'), 3)
 })
 
-test('extractionInstructionForCompact: 规则1 用词数口径 (≤35 词), 不再用 "≤50 字"', () => {
+test('extractionInstructionForCompact: 长度用词数口径 (≤45 词 / ≤160 字符), 不再用 "≤50 字"', () => {
   const instr = extractionInstructionForCompact('测试项目', 10)
   const text = instr.content[0].text
-  assert.match(text, /≤35 词/)
-  assert.match(text, /中文按字算，英文按单词算/)
+  assert.match(text, /≤45 词/)
+  assert.match(text, /汉字按字算，英文按单词算/)
+  assert.match(text, /≤160 字符/)
   assert.doesNotMatch(text, /≤50 字/)
 })
 
@@ -248,15 +249,15 @@ test('writeSimpleEntries: 大小上限 (超 maxMdBytes 不写)', () => {
 test('writeSimpleEntries: 超长 simple 拒绝落盘 (MD_TOO_LONG 护栏, 词数口径)', () => {
   const { collector, deps, mem } = makeDeps({ tag: 'write-too-long' })
   const r = createExperienceReviewer(deps)
-  // 36 个汉字 = 36 词 > 35 → 拒绝
-  r.writeSimpleEntries([{ scope: 'project', suggestGlobal: false, text: '字'.repeat(36) }])
+  // 46 个汉字 = 46 词 > 45 → 拒绝
+  r.writeSimpleEntries([{ scope: 'project', suggestGlobal: false, text: '字'.repeat(46) }])
   const md = mem.read(join(deps.directory, 'AGENTS.md'))
   assert.equal(md, '')
   assert.match(collector.lines.join('\n'), /MD_TOO_LONG/)
-  assert.match(collector.lines.join('\n'), /words=36 max=35/)
+  assert.match(collector.lines.join('\n'), /words=46 max=45/)
 })
 
-test('writeSimpleEntries: 词数口径下 35 词放行 (含英文, 旧字符口径会误杀)', () => {
+test('writeSimpleEntries: 词数口径下 45 词内放行 (含英文, 旧字符口径会误杀)', () => {
   const { collector, deps, mem } = makeDeps({ tag: 'write-wordcap-ok' })
   const r = createExperienceReviewer(deps)
   // 真实历史条目: 53 字符 / 23 词 —— 旧口径 (字符<=50) 会丢, 新口径放行
@@ -270,12 +271,12 @@ test('writeSimpleEntries: 词数口径下 35 词放行 (含英文, 旧字符口�
 test('writeSimpleEntries: 无空格长串被字符硬顶拦住 (词数口径漏网场景)', () => {
   const { collector, deps, mem } = makeDeps({ tag: 'write-hardcap' })
   const r = createExperienceReviewer(deps)
-  // 1 个英文 token = 1 词, 词数口径放行, 但 200 字符 > 120 硬顶 → 拒绝
+  // 1 个英文 token = 1 词, 词数口径放行, 但 200 字符 > 160 硬顶 → 拒绝
   r.writeSimpleEntries([{ scope: 'project', suggestGlobal: false, text: 'x'.repeat(200) }])
   const md = mem.read(join(deps.directory, 'AGENTS.md'))
   assert.equal(md, '')
   assert.match(collector.lines.join('\n'), /MD_TOO_LONG/)
-  assert.match(collector.lines.join('\n'), /chars=200 maxChars=120/)
+  assert.match(collector.lines.join('\n'), /chars=200 maxChars=160/)
 })
 
 test('writeSimpleEntries: 空数组 → 不动文件, 写 NOOP 日志', () => {
@@ -639,7 +640,7 @@ test('ensureRecycleReminder: 条目数 < 100 → 不注入', () => {
   assert.equal(msg.content.length, 1)
 })
 
-test('ensureRecycleReminder: 清理标准与写入侧四类口径对齐 + 保护外部注入块', () => {
+test('ensureRecycleReminder: 清理标准与写入侧同一把尺子 (v5.6: 只留用户侧准则, 工作内容一律删) + 保护外部注入块', () => {
   const lines = []
   for (let i = 1; i <= 105; i++) lines.push(`- [2026-10-13] 规则 ${i}`)
   const { deps } = makeDeps({ tag: 'recycle-align', content: lines.join('\n') })
@@ -647,16 +648,17 @@ test('ensureRecycleReminder: 清理标准与写入侧四类口径对齐 + 保护
   const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
   r.ensureRecycleReminder({ messages: [msg] })
   const text = msg.content[1].text
-  // 清理标准 = 写入侧同一把尺子 (Claude 四类)
-  for (const k of ['user', 'feedback', 'project', 'reference']) {
-    assert.match(text, new RegExp(k))
-  }
-  assert.match(text, /四类都不沾 → 删/)
-  // 清理侧同样排除「用户布置的任务/指令本身」(与写入侧同一把尺子, v5.5)
-  assert.match(text, /一律删: 用户布置的任务\/指令本身/)
-  assert.match(text, /重复同义/)
+  // 清理标准 = 写入侧同一把尺子 (T0/T1/T2)
+  assert.match(text, /用户对未来行为的普适约束/)
+  assert.match(text, /用户对 agent 行为的批评与褒奖/)
+  assert.match(text, /重复犯\(≥2 次\)且造成实际损失/)
+  // 工作内容一律删 (含实现细节/技术事实/变更与过程/任务方案)
+  assert.match(text, /都是"工作内容", 不是经验/)
+  assert.match(text, /实现细节、算法步骤、规则编号/)
+  assert.match(text, /技术事实、选型、具体取值/)
+  assert.match(text, /判断口径与写入侧完全一致/)
+  // 同义去重 + 外部注入块保护
   assert.match(text, /措辞不同也算同义/)
-  // 外部注入块保护
   assert.match(text, /不要动 <!-- XXX:START\/END --> 这类外部注入块/)
 })
 
@@ -987,25 +989,27 @@ test('writeSimpleEntries: MD_FULL 拒绝的条目不占每批额度 (额度留�
   assert.match(collector.lines.join('\n'), /MD_FULL/)
 })
 
-test('extractionInstructionForCompact: 含 Claude 四类口径 + 硬排除 + 每批上限', () => {
+test('extractionInstructionForCompact: 含 T0/T1/T2 分级 + 工作内容禁项 + 每批上限', () => {
   const { text } = extractionInstructionForCompact('我的项目', 3).content[0]
-  // Claude auto memory 四类
-  assert.match(text, /user\s+用户的角色/)
-  assert.match(text, /feedback\s+用户的纠正与确认/)
-  assert.match(text, /project\s+从代码推导不出的项目决策/)
-  assert.match(text, /reference\s+项目外部资源的位置/)
-  // 硬排除清单
-  assert.match(text, /能从代码\/仓库\/文档推导出来的/)
-  assert.match(text, /行业公开知识/)
-  // 硬排除: 用户任务/指令本身不算规范 (v5.5)
-  assert.match(text, /用户布置的任务\/指令本身/)
-  assert.match(text, /任务不是规范/)
-  // 宁缺毋滥 + 动态告知上限 (上限不是目标, 0~N 皆可)
-  assert.match(text, /0~2 条皆可/)
-  assert.match(text, /上限不是目标/)
-  assert.match(text, /绝不凑数/)
-  assert.doesNotMatch(text, /最多输出 2 条/) // 旧措辞不许复活
-  // 旧口径不许复活
-  assert.match(text, /≤35 词/)
+  // 分级 (级别从高到低)
+  assert.match(text, /要什么（最多 2 条，级别从高到低）/)
+  assert.match(text, /T0 用户对未来行为的普适约束/)
+  assert.match(text, /T1 用户对 agent 行为的批评与褒奖/)
+  assert.match(text, /T2 你自己重复犯（≥2 次）且造成实际损失/)
+  // 工作内容禁项 (本次工作里得知/决定/做过的一切)
+  assert.match(text, /不要什么（T0\/T1\/T2 之外的一律不写）/)
+  assert.match(text, /都是工作内容，不是经验/)
+  assert.match(text, /AGENTS\.md 里已有的（措辞不同也算）也不写/)
+  // 判断口径 + 来源
+  assert.match(text, /这次做的事/)
+  assert.match(text, /以后每次做事都适用的准则/)
+  assert.match(text, /说不清来源的不写/)
+  // 长度口径
+  assert.match(text, /≤45 词/)
+  assert.match(text, /≤160 字符/)
   assert.doesNotMatch(text, /≤50 字/)
+  // 旧口径不许复活
+  assert.doesNotMatch(text, /0~2 条皆可/)
+  assert.doesNotMatch(text, /宁缺毋滥/)
+  assert.doesNotMatch(text, /四类口径/)
 })
