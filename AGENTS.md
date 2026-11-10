@@ -1,28 +1,8 @@
 > **项目概述**: 本项目是 opencode 修改资产与部署手册仓库，收录解决具体痛点的插件（watchdog 卡死检测 / task-context-injector 子代理上下文注入 / experience-reviewer 经验提取）及运维脚本，每个子项目可独立验证、可回滚。
-- experience-reviewer v5 只在 session.compaction.ended 触发(搭 compact 的模型调用顺带提取), 没有轮次/时间触发; v2/v3 的 EXP_REVIEW_ROUND_INTERVAL / EXP_REVIEW_TIME_INTERVAL_MS / EXP_REVIEW_MAX_MESSAGES / fireReview 已全部移除, 看到这些变量名即为过时文档
-- experience-reviewer v5 零额外模型调用: 借 compact 摘要那一次模型调用同时产出 summary+JSON, 提取指令固定段追加在 compact prompt 末尾(不破坏主会话 transcript 的 KV cache 前缀)
-- 项目同时支持 node + bun 双运行时, 改完核心逻辑除了跑全量 Jest 测试, 还要跑 bun smoke 验双运行时兼容
-- 经验沉淀 v5 只走 simple 路径: ≤35 词单句写入项目 AGENTS.md; v2 的"长条目走独立经验库"分流在 v5 已不产出 complex, 相关 HTTP 导出仅保留给测试用
-- 提取提示词的 simple 约束必须量化(≤35 词单句，汉字按字、英文按单词，一个标识符算一词), 仅写"一句话"会让 LLM 输出百字长句冒充
-- 提取范围按 Claude auto memory 四类口径: user(用户角色/偏好) / feedback(用户纠正与确认) / project(代码推导不出的决策) / reference(外部资源位置); 硬排除可从代码推导、一次性安排、已交付产物写法、行业公开知识、AGENTS.md 已有
-- 验证 KV cache 命中率从模型返回的 usage.tokens.cache.read/write 拿, 写进 cursor 统计字段
-- 提取 prompt 的 KV cache 友好结构 = 对话前置 + 规则最末 (v1 结构为最终正确): 稳定段 = 与主会话共享的 system+对话前缀, 放最前; 自定义规则段前置会截断共享前缀, 命中率降至其占比 (~5%), 生产多项目实测对话前置 ~98%; 曾翻面(规则前置)后所有项目跌 ~5% 已回滚; 删工具调用但保留工具返回内容、且去调用后前缀仍稳定才能命中; 验证 cache 提升不能靠 E2E rewind 同源切片 (人造 99% vs 生产 5%), 必须真实生产多项目实测
-- AGENTS.md 是项目级变量, 塞进 subagent 会把固定前缀变变量前缀, 摧毁缓存复用
-- MiniMax 缓存即前缀匹配且不认 session: 提取请求对话段与主会话累积历史前缀一致即命中(跨 REVIEW 98%)
-- review 提取结果 PROMPT_LEN=0 时先查 cursor 窗口内是否有"完整轮次"(user 消息 + 对应 assistant 回复)；若唯一新 user 消息尚无 assistant 回复则无完整轮次，诊断需把 cursor 前移到最近完整轮次之前再重查 DB 轮次边界。
-- 开关拦截双点: 最早钩子入口先拦(不写 cursor=零开销), 直接调用入口兜底
-- 经验写入只追加无回收; 同义改写能绕过字面去重 → v5.3 已加 2-gram Jaccard≥0.55 近重复检测(种子=已有 AGENTS.md 条目+本批已选), 335 条存量实测检出 13 对近重复
-- 收紧经验准入的主杠杆是"每批条数上限"(默认 2, EXP_SIMPLE_MAX_PER_BATCH), 不是单条长度: 676 条历史提取实测每批≤2 降 55.4%, ≤1 降 76.9%
-- 中文语境下用正则硬排"代码可推导"误伤率高: AGENTS.md 这类文档路径就命中, 把用户明确偏好也误杀(66 条) → 该判据交给提示词侧让模型判, 插件侧只兜"整条就是代码"
-- "用户信号/用户锚点"只能用于排序不能用于硬排: 硬排会误杀"V2 plugin ctx 拿项目目录用 ctx.directory"这类高价值通用技术坑
-- 项目身份不能只靠路径和文件夹名，需在提示词注入一行项目自述
-- 从 AGENTS.md 提取项目概述不可靠：多数项目 AGENTS.md 全是规则条目，无一句自述
-- 纯净 subagent 冷提取看不到代码库，是经验过度泛化的结构性原因
-- 项目概述标记用 > **项目概述**: ，不能用 # 标题，否则与已有文档首行冲突被误判为已有。
-- 主 agent 流程内直接注入提取指令会打断主线，批量复盘应走独立 subagent。
-- 经验回收设计: 条数达阈值就提醒主 agent 主动检查(删无用、合并重复), 不做自动淘汰; 回收提醒只用固定上限判据, 绝不存上次条数基线——基线会在条目数清理回落后被重置, 导致再次超上限时被静默吞掉。
-- 经验达上限后由主 agent 确认去留
-- 插件持久 state 不感知用户手删文件，概述被删后需手动清 cursor 才能重注入
+- 项目同时支持 node + bun 双运行时, 改完核心逻辑除了跑全量单测, 还要跑 bun smoke 验双运行时兼容
+- 写提示词的约束必须量化(字数/词数/条数), 只写"一句话"会被 LLM 用百字长句冒充
+- 批量复盘/提取应走独立 subagent, 在主 agent 流程内直接注入提取指令会打断主线
+- 经验回收由主 agent 确认去留, 不做自动淘汰; 回收提醒只用固定上限判据, 绝不存"上次条数"基线——条目清理回落后基线被重置, 会静默吞掉下一次超限提醒
 
 <!-- OCM:START (scope=project) (do not edit this block manually) -->
 ## ⚠️ 可用项目经验 (21 条 — 任务开始前必查)
