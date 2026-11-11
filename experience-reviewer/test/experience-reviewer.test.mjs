@@ -649,7 +649,7 @@ test('ensureRecycleReminder: 清理标准与写入侧同一把尺子 (v5.6: 只�
   r.ensureRecycleReminder({ messages: [msg] })
   const text = msg.content[1].text
   // 清理标准 = 写入侧同一把尺子 (T0/T1/T2)
-  assert.match(text, /用户对未来行为的普适约束/)
+  assert.match(text, /用户对你做事方式的普适约束/)
   assert.match(text, /用户对 agent 行为的批评与褒奖/)
   assert.match(text, /重复犯\(≥2 次\)且造成实际损失/)
   // 工作内容一律删 (含实现细节/技术事实/变更与过程/任务方案)
@@ -657,6 +657,8 @@ test('ensureRecycleReminder: 清理标准与写入侧同一把尺子 (v5.6: 只�
   assert.match(text, /实现细节、算法步骤、规则编号/)
   assert.match(text, /技术事实、选型、具体取值/)
   assert.match(text, /判断口径与写入侧完全一致/)
+  assert.match(text, /约束的是你, 还是你正在开发的东西/)
+  assert.match(text, /产品的需求与验收标准/)
   // 同义去重 + 外部注入块保护
   assert.match(text, /措辞不同也算同义/)
   assert.match(text, /不要动 <!-- XXX:START\/END --> 这类外部注入块/)
@@ -993,16 +995,21 @@ test('extractionInstructionForCompact: 含 T0/T1/T2 分级 + 工作内容禁项 
   const { text } = extractionInstructionForCompact('我的项目', 3).content[0]
   // 分级 (级别从高到低)
   assert.match(text, /要什么（最多 2 条，级别从高到低）/)
-  assert.match(text, /T0 用户对未来行为的普适约束/)
+  assert.match(text, /T0 用户对你做事方式的普适约束/)
   assert.match(text, /T1 用户对 agent 行为的批评与褒奖/)
   assert.match(text, /T2 你自己重复犯（≥2 次）且造成实际损失/)
   // 工作内容禁项 (本次工作里得知/决定/做过的一切)
   assert.match(text, /不要什么（T0\/T1\/T2 之外的一律不写）/)
   assert.match(text, /都是工作内容，不是经验/)
+  // v5.6.1: 约束对象判据 —— 对「正在开发的产品」的要求是任务, 不是经验
+  assert.match(text, /用户对你正在开发的东西的要求/)
+  assert.match(text, /必须写进 MCP/)
+  assert.match(text, /做完即结束、规则已由代码承载/)
   assert.match(text, /AGENTS\.md 里已有的（措辞不同也算）也不写/)
   // 判断口径 + 来源
   assert.match(text, /这次做的事/)
   assert.match(text, /以后每次做事都适用的准则/)
+  assert.match(text, /它约束的是你，还是你正在开发的东西/)
   assert.match(text, /说不清来源的不写/)
   // 长度口径
   assert.match(text, /≤45 词/)
