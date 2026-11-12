@@ -465,9 +465,9 @@ function extractionInstructionForCompact(projectOverview = '', entryCount = 0) {
     'T1 用户对你「工作习惯」的长期评价（不是这一次做得好不好）\n' +
     'T2 你自己跨任务重复犯且造成实际损失的错（不是同一处改两遍）\n' +
     '\n' +
+    '先自检：你刚写的摘要 = 本次任务的内容。候选条目跟摘要里已经写过的内容说的是同一件事（换了说法也算 —— 摘要写了"心跳改成 60 秒"，就别再写"用户嫌 3 秒太快、2 分钟太慢"）→ 工作内容，丢弃，不许写成经验。\n' +
     '唯一判据：这条讲的是「你（agent）以后该怎么做」，还是「这件事该做成什么样」？\n' +
     '前者才是经验；后者 —— 需求、领域/数据/接口规则、参数取值、方案选型、这次的对错、用户这次的夸奖或纠正 —— 都是工作内容，一个字都不存。\n' +
-    '凡是换个任务就作废的，一律是工作内容，不管它披着任务、纠正、表扬、批评还是技术结论的皮。\n' +
     '拿不准 → 不存；宁可不存，也不要存错。AGENTS.md 里已有的（措辞不同也算）也不存。\n' +
     '\n' +
     '其他：\n' +
@@ -713,6 +713,8 @@ function createExperienceReviewer(deps) {
    * 一切"本次工作内容"(实现细节 / 变更日志 / 调试过程 / 具体取值选型 / 技术事实) 一律不进。
    * v5.6.1 补一层判据: 约束对象是「你(agent)」还是「你正在开发的产品」—— 后者是任务与验收标准,
    * 做完即结束、规则已由代码承载, 不再需要 AGENTS.md 记它(例: "把规则写进 MCP""改成扫盘不查索引")。
+   * v5.7.0 判据改成"对照自己刚写的摘要": 摘要 = 本次任务的内容, 候选条目跟摘要说的是同一件事
+   * (换了说法也算) → 工作内容, 丢弃。不用问模型"以后还用得上吗"(它一律答"会")—— 参照物是它自己写的摘要。
    */
   function writeSimpleEntries(entries) {
     if (!entries.length) return
@@ -937,7 +939,7 @@ function createExperienceReviewer(deps) {
       `【${projectName}】AGENTS.md 自有经验条目已达 ${count} 条, 目标压到 ${target} 条以内。\n` +
       `你自处理即可, 不必逐条展开处理过程——可在任务间隙按以下标准顺手处理:\n` +
       `唯一判据(与写入侧同一把尺子): 这条讲的是「你(agent)以后该怎么做」, 还是「这件事该做成什么样」? 前者才留, 后者一律删\n` +
-      `后者 = 需求、领域/数据/接口规则、参数取值、方案选型、这次的对错、用户这次的夸奖或纠正 —— 换个任务就作废, 与项目概述重叠的也算\n` +
+      `后者 = 需求、领域/数据/接口规则、参数取值、方案选型、这次的对错、用户这次的夸奖或纠正; 本次会话做过/讨论过/总结出来的具体内容(换了说法也算) —— 换个任务就作废的, 与项目概述重叠的也算\n` +
       `只有这类才留: 用户对你做事方式的普适约束(尤其反复强调的); 用户对你工作习惯的长期评价; agent 跨任务重复犯且造成实际损失的错\n` +
       `同义重复(说的是同一件事, 措辞不同也算同义)只留一条; 长期未用(时间戳久未刷新, 或无时间戳且创建已久)的优先审查删除, 拿不准的保留。\n` +
       `只处理本项目自己写的条目, 不要动 <!-- XXX:START/END --> 这类外部注入块。\n` +
@@ -988,7 +990,7 @@ const plugin = {
   id: 'opencode-experience-reviewer',
   setup: async (ctx) => {
     debugLog(
-      `setup() STARTED ${MARKER} v5.6.4(agent-vs-work) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
+      `setup() STARTED ${MARKER} v5.7.0(summary-selfcheck) maxMdBytes=${MAX_MD_BYTES} maxPerBatch=${SIMPLE_MAX_PER_BATCH} enabled=${ENABLED}`
     )
     if (!ENABLED) {
       debugLog('setup() DISABLED (ENABLED=false)')

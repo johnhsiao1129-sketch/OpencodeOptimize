@@ -648,11 +648,13 @@ test('ensureRecycleReminder: 清理标准与写入侧同一把尺子 (v5.6: 只�
   const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] }
   r.ensureRecycleReminder({ messages: [msg] })
   const text = msg.content[1].text
-  // 清理标准 = 写入侧同一把尺子 (v5.6.4: agent-vs-work)
+  // 清理标准 = 写入侧同一把尺子 (v5.7.0: 摘要自检 + agent-vs-work)
   assert.match(text, /唯一判据\(与写入侧同一把尺子\)/)
   assert.match(text, /这条讲的是「你\(agent\)以后该怎么做」, 还是「这件事该做成什么样」/)
   assert.match(text, /前者才留, 后者一律删/)
   assert.match(text, /领域\/数据\/接口规则/)
+  assert.match(text, /本次会话做过\/讨论过\/总结出来的具体内容/)
+  assert.match(text, /换了说法也算/)
   assert.match(text, /换个任务就作废/)
   assert.match(text, /只有这类才留/)
   assert.match(text, /用户对你做事方式的普适约束/)
@@ -998,13 +1000,20 @@ test('extractionInstructionForCompact: 含 T0/T1/T2 分级 + 工作内容禁项 
   assert.match(text, /T1 用户对你「工作习惯」的长期评价/)
   assert.match(text, /T2 你自己跨任务重复犯且造成实际损失/)
   assert.match(text, /不是同一处改两遍/)
-  // v5.6.4: 判据 = 讲的是「你以后该怎么做」还是「这件事该做成什么样」
+  // v5.7.0: 判据 = 对照自己刚写的摘要 (客观参照物; 不问模型"以后还用得上吗" —— 它一律答"会")
+  assert.match(text, /先自检：你刚写的摘要 = 本次任务的内容/)
+  assert.match(text, /跟摘要里已经写过的内容说的是同一件事/)
+  assert.match(text, /换了说法也算/)
+  assert.match(text, /心跳改成 60 秒/)
+  assert.match(text, /工作内容，丢弃，不许写成经验/)
+  // v5.6.4: 主体判据仍在 (挡领域规则: "不能有游离的边")
   assert.match(text, /唯一判据：这条讲的是「你（agent）以后该怎么做」，还是「这件事该做成什么样」/)
   assert.match(text, /前者才是经验/)
   assert.match(text, /领域\/数据\/接口规则/)
   assert.match(text, /都是工作内容，一个字都不存/)
-  assert.match(text, /凡是换个任务就作废的，一律是工作内容/)
-  assert.match(text, /不管它披着任务、纠正、表扬、批评还是技术结论的皮/)
+  // 主观的"以后还会用吗"问法不许复活
+  assert.doesNotMatch(text, /凡是换个任务就作废的/)
+  assert.doesNotMatch(text, /不管它披着任务、纠正、表扬、批评还是技术结论的皮/)
   assert.match(text, /拿不准 → 不存/)
   assert.match(text, /AGENTS\.md 里已有的（措辞不同也算）也不存/)
   // 长度口径
